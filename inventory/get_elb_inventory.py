@@ -87,7 +87,8 @@ def scan_elb(session, regions, writer):
                 pass
 
         except Exception as e:
-            logger.warning(f"  {region}: Error — {e}")
+            if not is_region_unsupported_error(e):
+                logger.warning(f"  {region}: Error — {e}")
 
         lb_count = len(region_data["load_balancers"])
         clb_count = len(region_data["classic_lbs"])

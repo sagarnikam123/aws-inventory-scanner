@@ -76,7 +76,10 @@ def scan_opensearch_domains(session, regions, writer):
                                 f"{total_storage} GB storage")
 
         except Exception as e:
-            logger.warning(f"  {region}: Error — {e}")
+            if is_region_unsupported_error(e):
+                log_region_skip(region, 'opensearch', str(e))
+            else:
+                logger.warning(f"  {region}: Error — {e}")
             writer.set_nested("regions", region, value=[])
 
     return total_domains

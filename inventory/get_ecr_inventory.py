@@ -65,7 +65,10 @@ def scan_ecr_repositories(session, regions, writer):
                 logger.info(f"  {region}: {len(repos)} repositories, {sum(r['image_count'] for r in repos)} images")
 
         except Exception as e:
-            logger.warning(f"  {region}: Error — {e}")
+            if is_region_unsupported_error(e):
+                log_region_skip(region, 'ecr', str(e))
+            else:
+                logger.warning(f"  {region}: Error — {e}")
             writer.set_nested("regions", region, value=[])
 
     return total_repos, total_images

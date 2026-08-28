@@ -77,7 +77,10 @@ def scan_rds(session, regions, writer):
                 logger.info(f"  {region}: {len(clusters)} clusters, {len(instances)} instances")
 
         except Exception as e:
-            logger.warning(f"  {region}: Error — {e}")
+            if is_region_unsupported_error(e):
+                log_region_skip(region, 'rds', str(e))
+            else:
+                logger.warning(f"  {region}: Error — {e}")
             writer.set_nested("regions", region, value={"clusters": [], "instances": []})
 
     return total_clusters, total_instances
