@@ -17,15 +17,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common import (
     logger, BOTO_CONFIG, get_accounts, get_regions, create_session,
-    get_output_dir, save_json, get_timestamp, add_common_args,
+    get_output_dir, get_timestamp, add_common_args,
     create_session_with_identity, is_region_unsupported_error, log_region_skip,
-    run_with_timer, make_output_filename,
+    run_with_timer, make_output_filename, IncrementalWriter,
 )
 
 
-def scan_waf(session, regions):
+def scan_waf(session, regions, writer):
     """Scan WAFv2 Web ACLs across regional and CloudFront (global) scopes."""
-    results = {}
     total_web_acls = 0
 
     # Regional WAFs
@@ -52,7 +51,7 @@ def scan_waf(session, regions):
                     "arn": acl.get('ARN', ''),
                 })
 
-            results[region] = web_acls
+            writer.set_nested("regions", region, value=web_acls)
             total_web_acls += len(web_acls)
 
             if web_acls:
@@ -60,7 +59,7 @@ def scan_waf(session, regions):
 
         except Exception as e:
             logger.warning(f"  {region}: Error — {e}")
-            results[region] = []
+            writer.set_nested("regions", region, value=[])
 
     # CloudFront (global) WAFs — must query from us-east-1
     try:
@@ -85,13 +84,13 @@ def scan_waf(session, regions):
 
         if cf_acls:
             logger.info(f"  CLOUDFRONT (global): {len(cf_acls)} Web ACLs")
-            results["cloudfront-global"] = cf_acls
+            writer.set_nested("regions", "cloudfront-global", value=cf_acls)
             total_web_acls += len(cf_acls)
 
     except Exception as e:
         logger.warning(f"  CLOUDFRONT scope: Error — {e}")
 
-    return results, total_web_acls
+    return total_web_acls
 
 
 def main():
@@ -131,18 +130,17 @@ def main():
             inventory["accounts"][account_id] = {"name": name, "status": "auth_failed", "regions": {}}
             continue
 
-        results, total = scan_waf(session, regions)
-
-        account_entry = {
-            "name": name, "profile_used": profile, "status": "ok",
-            "total_web_acls": total, "regions": results
-        }
-
-        inventory["accounts"][account_id] = account_entry
-        inventory["summary"]["total_web_acls"] += total
-
         output_dir = get_output_dir(account_id, "waf")
-        save_json(account_entry, output_dir, make_output_filename("waf", account_id, timestamp))
+        writer = IncrementalWriter(output_dir, make_output_filename("waf", account_id, timestamp))
+        writer.update({"name": name, "profile_used": profile, "status": "in_progress", "regions": {}})
+
+        total = scan_waf(session, regions, writer)
+
+        writer.set("total_web_acls", total)
+        writer.set("status", "ok")
+
+        inventory["accounts"][account_id] = {"name": name, "status": "ok"}
+        inventory["summary"]["total_web_acls"] += total
 
     logger.info("\n" + "=" * 60)
     logger.info("📊 SUMMARY")

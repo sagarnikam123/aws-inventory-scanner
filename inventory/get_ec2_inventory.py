@@ -20,18 +20,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common import (
     logger, BOTO_CONFIG, get_accounts, get_regions, create_session,
-    get_output_dir, save_json, get_timestamp, add_common_args,
+    get_output_dir, get_timestamp, add_common_args,
     create_session_with_identity, is_region_unsupported_error, log_region_skip,
-    run_with_timer, make_output_filename,
+    run_with_timer, make_output_filename, IncrementalWriter,
 )
 
 
 TERMINATED_STATES = ['terminated', 'shutting-down']
 
 
-def scan_ec2_instances(session, regions, tag_filter=None):
+def scan_ec2_instances(session, regions, writer, tag_filter=None):
     """Scan EC2 instances across all specified regions."""
-    results = {}
     total_instances = 0
 
     filters = []
@@ -86,8 +85,10 @@ def scan_ec2_instances(session, regions, tag_filter=None):
 
             # Filter out terminated
             active_instances = [i for i in instances if i['state'] not in TERMINATED_STATES]
-            results[region] = active_instances
             total_instances += len(active_instances)
+
+            # Flush per-region
+            writer.set_nested("regions", region, value=active_instances)
 
             if active_instances:
                 logger.info(f"  {region}: {len(active_instances)} instances")
@@ -97,9 +98,9 @@ def scan_ec2_instances(session, regions, tag_filter=None):
                 log_region_skip(region, 'ec2', str(e))
             else:
                 logger.warning(f"  {region}: Error — {e}")
-            results[region] = []
+            writer.set_nested("regions", region, value=[])
 
-    return results, total_instances
+    return total_instances
 
 
 def main():
@@ -149,23 +150,16 @@ def main():
             }
             continue
 
-        results, total = scan_ec2_instances(session, regions, args.tag)
+        output_dir = get_output_dir(account_id, "ec2")
+        writer = IncrementalWriter(output_dir, make_output_filename("ec2", account_id, timestamp))
+        writer.update({"name": name, "profile_used": profile, "status": "in_progress", "regions": {}})
 
-        account_entry = {
-            "name": name,
-            "profile_used": profile,
-            "status": "ok",
-            "total_instances": total,
-            "regions": results
-        }
+        total = scan_ec2_instances(session, regions, writer, args.tag)
+        writer.set("total_instances", total)
+        writer.set("status", "ok")
 
-        inventory["accounts"][account_id] = account_entry
         inventory["summary"]["instances_by_account"][account_id] = total
         inventory["summary"]["total_instances_found"] += total
-
-        # Per-account file
-        output_dir = get_output_dir(account_id, "ec2")
-        save_json(account_entry, output_dir, make_output_filename("ec2", account_id, timestamp))
 
     # Summary
     logger.info("\n" + "=" * 60)

@@ -17,15 +17,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common import (
     logger, BOTO_CONFIG, get_accounts, get_regions, create_session,
-    get_output_dir, save_json, get_timestamp, add_common_args,
+    get_output_dir, get_timestamp, add_common_args,
     create_session_with_identity, is_region_unsupported_error, log_region_skip,
-    run_with_timer, make_output_filename,
+    run_with_timer, make_output_filename, IncrementalWriter,
 )
 
 
-def scan_elb(session, regions):
+def scan_elb(session, regions, writer):
     """Scan ALBs, NLBs, and Classic LBs with target groups."""
-    results = {}
     totals = {"alb_nlb": 0, "classic": 0, "target_groups": 0}
 
     for region in regions:
@@ -97,12 +96,12 @@ def scan_elb(session, regions):
         if lb_count > 0 or clb_count > 0:
             logger.info(f"  {region}: {lb_count} ALB/NLB, {clb_count} Classic, {tg_count} target groups")
 
-        results[region] = region_data
+        writer.set_nested("regions", region, value=region_data)
         totals["alb_nlb"] += lb_count
         totals["classic"] += clb_count
         totals["target_groups"] += tg_count
 
-    return results, totals
+    return totals
 
 
 def main():
@@ -142,23 +141,21 @@ def main():
             inventory["accounts"][account_id] = {"name": name, "status": "auth_failed", "regions": {}}
             continue
 
-        results, totals = scan_elb(session, regions)
+        output_dir = get_output_dir(account_id, "elb")
+        writer = IncrementalWriter(output_dir, make_output_filename("elb", account_id, timestamp))
+        writer.update({"name": name, "profile_used": profile, "status": "in_progress", "regions": {}})
 
-        account_entry = {
-            "name": name, "profile_used": profile, "status": "ok",
-            "total_alb_nlb": totals["alb_nlb"],
-            "total_classic": totals["classic"],
-            "total_target_groups": totals["target_groups"],
-            "regions": results
-        }
+        totals = scan_elb(session, regions, writer)
 
-        inventory["accounts"][account_id] = account_entry
+        writer.set("total_alb_nlb", totals["alb_nlb"])
+        writer.set("total_classic", totals["classic"])
+        writer.set("total_target_groups", totals["target_groups"])
+        writer.set("status", "ok")
+
+        inventory["accounts"][account_id] = {"name": name, "status": "ok"}
         inventory["summary"]["total_alb_nlb"] += totals["alb_nlb"]
         inventory["summary"]["total_classic"] += totals["classic"]
         inventory["summary"]["total_target_groups"] += totals["target_groups"]
-
-        output_dir = get_output_dir(account_id, "elb")
-        save_json(account_entry, output_dir, make_output_filename("elb", account_id, timestamp))
 
     total_lbs = inventory['summary']['total_alb_nlb'] + inventory['summary']['total_classic']
     logger.info("\n" + "=" * 60)

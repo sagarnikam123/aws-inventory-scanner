@@ -18,15 +18,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common import (
     logger, BOTO_CONFIG, get_accounts, get_regions, create_session,
-    get_output_dir, save_json, get_timestamp, add_common_args,
+    get_output_dir, get_timestamp, add_common_args,
     create_session_with_identity, is_region_unsupported_error, log_region_skip,
-    run_with_timer, make_output_filename,
+    run_with_timer, make_output_filename, IncrementalWriter,
 )
 
 
-def scan_rds(session, regions):
+def scan_rds(session, regions, writer):
     """Scan RDS clusters and instances across all specified regions."""
-    results = {}
     total_clusters = 0
     total_instances = 0
 
@@ -70,7 +69,7 @@ def scan_rds(session, regions):
             except Exception as e:
                 logger.warning(f"  {region}: Error listing instances — {e}")
 
-            results[region] = {"clusters": clusters, "instances": instances}
+            writer.set_nested("regions", region, value={"clusters": clusters, "instances": instances})
             total_clusters += len(clusters)
             total_instances += len(instances)
 
@@ -79,9 +78,9 @@ def scan_rds(session, regions):
 
         except Exception as e:
             logger.warning(f"  {region}: Error — {e}")
-            results[region] = {"clusters": [], "instances": []}
+            writer.set_nested("regions", region, value={"clusters": [], "instances": []})
 
-    return results, total_clusters, total_instances
+    return total_clusters, total_instances
 
 
 def main():
@@ -128,24 +127,17 @@ def main():
             }
             continue
 
-        results, clusters, instances = scan_rds(session, regions)
+        output_dir = get_output_dir(account_id, "rds")
+        writer = IncrementalWriter(output_dir, make_output_filename("rds", account_id, timestamp))
+        writer.update({"name": name, "profile_used": profile, "status": "in_progress", "regions": {}})
 
-        account_entry = {
-            "name": name,
-            "profile_used": profile,
-            "status": "ok",
-            "total_clusters": clusters,
-            "total_instances": instances,
-            "regions": results
-        }
+        clusters, instances = scan_rds(session, regions, writer)
+        writer.set("total_clusters", clusters)
+        writer.set("total_instances", instances)
+        writer.set("status", "ok")
 
-        inventory["accounts"][account_id] = account_entry
         inventory["summary"]["total_clusters"] += clusters
         inventory["summary"]["total_instances"] += instances
-
-        # Per-account file
-        output_dir = get_output_dir(account_id, "rds")
-        save_json(account_entry, output_dir, make_output_filename("rds", account_id, timestamp))
 
     # Summary
     logger.info("\n" + "=" * 60)

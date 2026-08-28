@@ -17,15 +17,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common import (
     logger, BOTO_CONFIG, get_accounts, get_regions, create_session,
-    get_output_dir, save_json, get_timestamp, add_common_args,
+    get_output_dir, get_timestamp, add_common_args,
     create_session_with_identity, is_region_unsupported_error, log_region_skip,
-    run_with_timer, make_output_filename,
+    run_with_timer, make_output_filename, IncrementalWriter,
 )
 
 
-def scan_opensearch_domains(session, regions):
+def scan_opensearch_domains(session, regions, writer):
     """Scan OpenSearch domains across all specified regions."""
-    results = {}
     total_domains = 0
 
     for region in regions:
@@ -66,7 +65,7 @@ def scan_opensearch_domains(session, regions):
                     }
                     domains.append(domain_info)
 
-            results[region] = domains
+            writer.set_nested("regions", region, value=domains)
             total_domains += len(domains)
 
             if domains:
@@ -78,9 +77,9 @@ def scan_opensearch_domains(session, regions):
 
         except Exception as e:
             logger.warning(f"  {region}: Error — {e}")
-            results[region] = []
+            writer.set_nested("regions", region, value=[])
 
-    return results, total_domains
+    return total_domains
 
 
 def main():
@@ -120,18 +119,17 @@ def main():
             inventory["accounts"][account_id] = {"name": name, "status": "auth_failed", "regions": {}}
             continue
 
-        results, total = scan_opensearch_domains(session, regions)
-
-        account_entry = {
-            "name": name, "profile_used": profile, "status": "ok",
-            "total_domains": total, "regions": results
-        }
-
-        inventory["accounts"][account_id] = account_entry
-        inventory["summary"]["total_domains"] += total
-
         output_dir = get_output_dir(account_id, "opensearch")
-        save_json(account_entry, output_dir, make_output_filename("opensearch", account_id, timestamp))
+        writer = IncrementalWriter(output_dir, make_output_filename("opensearch", account_id, timestamp))
+        writer.update({"name": name, "profile_used": profile, "status": "in_progress", "regions": {}})
+
+        total = scan_opensearch_domains(session, regions, writer)
+
+        writer.set("total_domains", total)
+        writer.set("status", "ok")
+
+        inventory["accounts"][account_id] = {"name": name, "status": "ok"}
+        inventory["summary"]["total_domains"] += total
 
     logger.info("\n" + "=" * 60)
     logger.info("📊 SUMMARY")

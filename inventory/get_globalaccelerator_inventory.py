@@ -16,13 +16,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common import (
     logger, BOTO_CONFIG, get_accounts, create_session,
-    get_output_dir, save_json, get_timestamp, add_common_args,
+    get_output_dir, get_timestamp, add_common_args,
     create_session_with_identity, is_region_unsupported_error, log_region_skip,
-    run_with_timer, make_output_filename,
+    run_with_timer, make_output_filename, IncrementalWriter,
 )
 
 
-def scan_global_accelerator(session):
+def scan_global_accelerator(session, writer):
     """Scan Global Accelerator resources (global service, query from us-west-2)."""
     accelerators = []
 
@@ -61,11 +61,12 @@ def scan_global_accelerator(session):
 
         if accelerators:
             logger.info(f"  {len(accelerators)} accelerators found")
+            writer.set("accelerators", accelerators)
 
     except Exception as e:
         logger.warning(f"  Error: {e}")
 
-    return accelerators
+    return len(accelerators)
 
 
 def main():
@@ -104,18 +105,17 @@ def main():
             inventory["accounts"][account_id] = {"name": name, "status": "auth_failed", "accelerators": []}
             continue
 
-        accelerators = scan_global_accelerator(session)
-
-        account_entry = {
-            "name": name, "profile_used": profile, "status": "ok",
-            "total_accelerators": len(accelerators), "accelerators": accelerators
-        }
-
-        inventory["accounts"][account_id] = account_entry
-        inventory["summary"]["total_accelerators"] += len(accelerators)
-
         output_dir = get_output_dir(account_id, "globalaccelerator")
-        save_json(account_entry, output_dir, make_output_filename("globalaccelerator", account_id, timestamp))
+        writer = IncrementalWriter(output_dir, make_output_filename("globalaccelerator", account_id, timestamp))
+        writer.update({"name": name, "profile_used": profile, "status": "in_progress", "accelerators": []})
+
+        accel_count = scan_global_accelerator(session, writer)
+
+        writer.set("total_accelerators", accel_count)
+        writer.set("status", "ok")
+
+        inventory["accounts"][account_id] = {"name": name, "status": "ok"}
+        inventory["summary"]["total_accelerators"] += accel_count
 
     logger.info("\n" + "=" * 60)
     logger.info("📊 SUMMARY")

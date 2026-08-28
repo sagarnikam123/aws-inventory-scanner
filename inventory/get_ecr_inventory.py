@@ -17,15 +17,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common import (
     logger, BOTO_CONFIG, get_accounts, get_regions, create_session,
-    get_output_dir, save_json, get_timestamp, add_common_args,
+    get_output_dir, get_timestamp, add_common_args,
     create_session_with_identity, is_region_unsupported_error, log_region_skip,
-    run_with_timer, make_output_filename,
+    run_with_timer, make_output_filename, IncrementalWriter,
 )
 
 
-def scan_ecr_repositories(session, regions):
+def scan_ecr_repositories(session, regions, writer):
     """Scan ECR repositories across all specified regions."""
-    results = {}
     total_repos = 0
     total_images = 0
 
@@ -58,7 +57,7 @@ def scan_ecr_repositories(session, regions):
                     }
                     repos.append(repo_info)
 
-            results[region] = repos
+            writer.set_nested("regions", region, value=repos)
             total_repos += len(repos)
             total_images += sum(r['image_count'] for r in repos)
 
@@ -67,9 +66,9 @@ def scan_ecr_repositories(session, regions):
 
         except Exception as e:
             logger.warning(f"  {region}: Error — {e}")
-            results[region] = []
+            writer.set_nested("regions", region, value=[])
 
-    return results, total_repos, total_images
+    return total_repos, total_images
 
 
 def main():
@@ -109,19 +108,17 @@ def main():
             inventory["accounts"][account_id] = {"name": name, "status": "auth_failed", "regions": {}}
             continue
 
-        results, repos, images = scan_ecr_repositories(session, regions)
+        output_dir = get_output_dir(account_id, "ecr")
+        writer = IncrementalWriter(output_dir, make_output_filename("ecr", account_id, timestamp))
+        writer.update({"name": name, "profile_used": profile, "status": "in_progress", "regions": {}})
 
-        account_entry = {
-            "name": name, "profile_used": profile, "status": "ok",
-            "total_repositories": repos, "total_images": images, "regions": results
-        }
+        repos, images = scan_ecr_repositories(session, regions, writer)
+        writer.set("total_repositories", repos)
+        writer.set("total_images", images)
+        writer.set("status", "ok")
 
-        inventory["accounts"][account_id] = account_entry
         inventory["summary"]["total_repositories"] += repos
         inventory["summary"]["total_images"] += images
-
-        output_dir = get_output_dir(account_id, "ecr")
-        save_json(account_entry, output_dir, make_output_filename("ecr", account_id, timestamp))
 
     logger.info("\n" + "=" * 60)
     logger.info("📊 SUMMARY")

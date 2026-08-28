@@ -17,15 +17,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common import (
     logger, BOTO_CONFIG, get_accounts, get_regions, create_session,
-    get_output_dir, save_json, get_timestamp, add_common_args,
+    get_output_dir, get_timestamp, add_common_args,
     create_session_with_identity, is_region_unsupported_error, log_region_skip,
-    run_with_timer, make_output_filename,
+    run_with_timer, make_output_filename, IncrementalWriter,
 )
 
 
-def scan_efs(session, regions):
+def scan_efs(session, regions, writer):
     """Scan EFS file systems across all specified regions."""
-    results = {}
     total_filesystems = 0
     total_size_gb = 0
 
@@ -58,7 +57,7 @@ def scan_efs(session, regions):
                 filesystems.append(fs_info)
                 total_size_gb += size_gb
 
-            results[region] = filesystems
+            writer.set_nested("regions", region, value=filesystems)
             total_filesystems += len(filesystems)
 
             if filesystems:
@@ -67,9 +66,9 @@ def scan_efs(session, regions):
 
         except Exception as e:
             logger.warning(f"  {region}: Error — {e}")
-            results[region] = []
+            writer.set_nested("regions", region, value=[])
 
-    return results, total_filesystems, total_size_gb
+    return total_filesystems, total_size_gb
 
 
 def main():
@@ -109,20 +108,19 @@ def main():
             inventory["accounts"][account_id] = {"name": name, "status": "auth_failed", "regions": {}}
             continue
 
-        results, fs_count, size_gb = scan_efs(session, regions)
+        output_dir = get_output_dir(account_id, "efs")
+        writer = IncrementalWriter(output_dir, make_output_filename("efs", account_id, timestamp))
+        writer.update({"name": name, "profile_used": profile, "status": "in_progress", "regions": {}})
 
-        account_entry = {
-            "name": name, "profile_used": profile, "status": "ok",
-            "total_filesystems": fs_count, "total_size_gb": round(size_gb, 2),
-            "regions": results
-        }
+        fs_count, size_gb = scan_efs(session, regions, writer)
 
-        inventory["accounts"][account_id] = account_entry
+        writer.set("total_filesystems", fs_count)
+        writer.set("total_size_gb", round(size_gb, 2))
+        writer.set("status", "ok")
+
+        inventory["accounts"][account_id] = {"name": name, "status": "ok"}
         inventory["summary"]["total_filesystems"] += fs_count
         inventory["summary"]["total_size_gb"] += size_gb
-
-        output_dir = get_output_dir(account_id, "efs")
-        save_json(account_entry, output_dir, make_output_filename("efs", account_id, timestamp))
 
     logger.info("\n" + "=" * 60)
     logger.info("📊 SUMMARY")

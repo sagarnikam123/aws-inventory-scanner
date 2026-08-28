@@ -17,9 +17,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common import (
     logger, BOTO_CONFIG, get_accounts, get_regions, create_session,
-    get_output_dir, save_json, get_timestamp, add_common_args,
+    get_output_dir, get_timestamp, add_common_args,
     create_session_with_identity, is_region_unsupported_error, log_region_skip,
-    run_with_timer, make_output_filename,
+    run_with_timer, make_output_filename, IncrementalWriter,
 )
 
 
@@ -33,9 +33,8 @@ def get_name_tag(tags):
     return 'N/A'
 
 
-def scan_vpc(session, regions):
+def scan_vpc(session, regions, writer):
     """Scan VPCs, subnets, NAT gateways, endpoints, and peering."""
-    results = {}
     totals = {"vpcs": 0, "subnets": 0, "nat_gateways": 0, "endpoints": 0, "peering": 0, "transit_gateways": 0, "tgw_attachments": 0}
 
     for region in regions:
@@ -167,7 +166,7 @@ def scan_vpc(session, regions):
         if vpc_count > 0:
             logger.info(f"  {region}: {vpc_count} VPCs, {nat_count} NAT GWs, {ep_count} endpoints, {tgw_count} TGWs, {tgw_att_count} TGW attachments")
 
-        results[region] = region_data
+        writer.set_nested("regions", region, value=region_data)
         totals["vpcs"] += vpc_count
         totals["nat_gateways"] += nat_count
         totals["endpoints"] += ep_count
@@ -175,7 +174,7 @@ def scan_vpc(session, regions):
         totals["transit_gateways"] += tgw_count
         totals["tgw_attachments"] += tgw_att_count
 
-    return results, totals
+    return totals
 
 
 def main():
@@ -215,26 +214,24 @@ def main():
             inventory["accounts"][account_id] = {"name": name, "status": "auth_failed", "regions": {}}
             continue
 
-        results, totals = scan_vpc(session, regions)
+        output_dir = get_output_dir(account_id, "vpc")
+        writer = IncrementalWriter(output_dir, make_output_filename("vpc", account_id, timestamp))
+        writer.update({"name": name, "profile_used": profile, "status": "in_progress", "regions": {}})
 
-        account_entry = {
-            "name": name, "profile_used": profile, "status": "ok",
-            "total_vpcs": totals["vpcs"],
-            "total_subnets": totals["subnets"],
-            "total_nat_gateways": totals["nat_gateways"],
-            "total_endpoints": totals["endpoints"],
-            "total_peering": totals["peering"],
-            "total_transit_gateways": totals["transit_gateways"],
-            "total_tgw_attachments": totals["tgw_attachments"],
-            "regions": results
-        }
+        totals = scan_vpc(session, regions, writer)
 
-        inventory["accounts"][account_id] = account_entry
+        writer.set("total_vpcs", totals["vpcs"])
+        writer.set("total_subnets", totals["subnets"])
+        writer.set("total_nat_gateways", totals["nat_gateways"])
+        writer.set("total_endpoints", totals["endpoints"])
+        writer.set("total_peering", totals["peering"])
+        writer.set("total_transit_gateways", totals["transit_gateways"])
+        writer.set("total_tgw_attachments", totals["tgw_attachments"])
+        writer.set("status", "ok")
+
+        inventory["accounts"][account_id] = {"name": name, "status": "ok"}
         for k in totals:
             inventory["summary"][f"total_{k}"] += totals[k]
-
-        output_dir = get_output_dir(account_id, "vpc")
-        save_json(account_entry, output_dir, make_output_filename("vpc", account_id, timestamp))
 
     logger.info("\n" + "=" * 60)
     logger.info("📊 SUMMARY")
