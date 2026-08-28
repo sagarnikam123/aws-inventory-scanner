@@ -1311,7 +1311,7 @@ def check_cost_emr_no_autoterminate(account_dir, days_threshold):
 
 
 def check_cost_s3_no_lifecycle(account_dir, days_threshold):
-    """S3 buckets without lifecycle policy — infinite storage growth."""
+    """S3 buckets with no lifecycle, retention > 1yr, or no Glacier transition."""
     findings = []
     path = find_latest_inventory(account_dir, "s3")
     if not path:
@@ -1322,16 +1322,48 @@ def check_cost_s3_no_lifecycle(account_dir, days_threshold):
 
     buckets = data.get("buckets", [])
     for bucket in buckets:
-        lifecycle = bucket.get("lifecycle_rules", bucket.get("lifecycle", None))
+        lifecycle = bucket.get("lifecycle", {})
         size_gb = bucket.get("size_gb", 0)
-        if lifecycle is not None and not lifecycle and size_gb > 10:
+        name = bucket.get("name", "unknown")
+        region = bucket.get("region", "global")
+
+        if not lifecycle or lifecycle.get("error"):
+            continue
+
+        retention_configured = lifecycle.get("retention_configured", False)
+        retention_days_list = lifecycle.get("retention_days") or []
+        transitions = lifecycle.get("transitions", [])
+
+        # Check 1: No lifecycle at all on a bucket > 10 GB
+        if not retention_configured and not transitions and size_gb > 10:
             findings.append(finding(
-                "cost", "S3", bucket.get("region", "global"),
-                bucket.get("name", "unknown"),
+                "cost", "S3", region, name,
                 f"No lifecycle policy ({size_gb:.0f} GB) — storage grows indefinitely",
                 "low" if size_gb < 100 else "medium",
-                est_monthly_cost=round(size_gb * 0.023, 2)  # S3 standard rate
+                est_monthly_cost=round(size_gb * 0.023, 2)
             ))
+            continue
+
+        # Check 2: Retention > 365 days (keeping data > 1 year)
+        long_retention = [d for d in retention_days_list if d > 365]
+        if long_retention and size_gb > 10:
+            max_days = max(long_retention)
+            findings.append(finding(
+                "cost", "S3", region, name,
+                f"Retention {max_days} days (>{max_days // 365} yr) on {size_gb:.0f} GB — review if needed that long",
+                "low",
+            ))
+
+        # Check 3: Has retention/lifecycle but no Glacier transition on large buckets
+        has_glacier = any("GLACIER" in t.upper() or "DEEP_ARCHIVE" in t.upper() for t in transitions)
+        if not has_glacier and size_gb > 50 and retention_configured:
+            findings.append(finding(
+                "cost", "S3", region, name,
+                f"No Glacier/Deep Archive transition ({size_gb:.0f} GB) — tiering could save 60-80%",
+                "medium" if size_gb > 500 else "low",
+                est_monthly_cost=round(size_gb * 0.019, 2)  # savings vs staying in Standard
+            ))
+
     return findings
 
 
