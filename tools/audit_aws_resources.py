@@ -1324,7 +1324,7 @@ def check_cost_s3_no_lifecycle(account_dir, days_threshold):
     for bucket in buckets:
         lifecycle = bucket.get("lifecycle", {})
         size_gb = bucket.get("size_gb", 0)
-        name = bucket.get("name", "unknown")
+        name = bucket.get("bucket_name", bucket.get("name", "unknown"))
         region = bucket.get("region", "global")
 
         if not lifecycle or lifecycle.get("error"):
