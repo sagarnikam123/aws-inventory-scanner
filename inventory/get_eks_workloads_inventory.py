@@ -464,8 +464,10 @@ def main():
                     acct_clusters += 1
                     acct_namespaces += cluster_data.get("total_namespaces", 0)
 
-            # Flush after all clusters in region complete
-            account_writer.set_nested("regions", region, value=region_data)
+                    # Flush after each cluster — crash-safe
+                    account_writer.set_nested("regions", region, value=region_data)
+
+            # (region complete)
 
         combined_data["accounts"][account_id] = account_writer.get_data()
 
