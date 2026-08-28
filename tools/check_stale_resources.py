@@ -1241,7 +1241,8 @@ def main():
     audit_dir = OUTPUT_DIR / "audit"
     audit_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    audit_file = audit_dir / f"audit-report-{timestamp}.json"
+    account_ids = "-".join(sorted(d.name for d in account_dirs))
+    audit_file = audit_dir / f"audit-report-{account_ids}-{timestamp}.json"
     with open(audit_file, 'w') as f:
         json.dump(output_data, f, indent=2, default=str)
     print(f"  📄 Saved: {audit_file}")
