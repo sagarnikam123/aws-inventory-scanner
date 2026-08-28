@@ -1609,7 +1609,7 @@ def main():
     account_ids = sorted(d.name for d in account_dirs)[0]
     audit_file = audit_dir / f"audit-report-{account_ids}-{timestamp}.json"
     with open(audit_file, 'w') as f:
-        json.dump(output_data, f, indent=2, default=str)
+        json.dump(output_data, f, indent=2, default=str, ensure_ascii=False)
     print(f"  📄 Saved: {audit_file}")
 
     if args.json:
