@@ -50,6 +50,10 @@ def scan_kinesis(session, regions, writer):
                             "created_at": summary.get('StreamCreationTimestamp', ''),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    log_region_skip(region, SERVICE, str(e))
+                    writer.set_nested("regions", region, value=region_data)
+                    continue
                 logger.warning(f"  {region}: Data Streams error — {e}")
 
             # Firehose Delivery Streams
@@ -71,7 +75,8 @@ def scan_kinesis(session, regions, writer):
                     except Exception:
                         region_data["firehose_streams"].append({"stream_name": stream_name, "status": "describe_failed"})
             except Exception as e:
-                logger.warning(f"  {region}: Firehose error — {e}")
+                if not is_region_unsupported_error(e):
+                    logger.warning(f"  {region}: Firehose error — {e}")
 
             writer.set_nested("regions", region, value=region_data)
             total_streams += len(region_data["data_streams"])
