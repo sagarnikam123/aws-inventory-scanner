@@ -18,9 +18,9 @@ from botocore.config import Config
 
 # Boto3 client config with timeouts
 BOTO_CONFIG = Config(
-    connect_timeout=10,
+    connect_timeout=5,
     read_timeout=30,
-    retries={'max_attempts': 2}
+    retries={'max_attempts': 1}
 )
 
 # Paths
@@ -265,6 +265,8 @@ def is_region_unsupported_error(error) -> bool:
         "not available in this region",
         "Could not connect to the endpoint URL",
         "EndpointConnectionError",
+        "Connect timeout on endpoint URL",
+        "ConnectTimeoutError",
     ]
     return any(indicator in error_str for indicator in unsupported_indicators)
 
