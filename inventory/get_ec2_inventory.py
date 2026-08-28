@@ -158,6 +158,7 @@ def main():
         writer.set("total_instances", total)
         writer.set("status", "ok")
 
+        inventory["accounts"][account_id] = {"name": name}
         inventory["summary"]["instances_by_account"][account_id] = total
         inventory["summary"]["total_instances_found"] += total
 
