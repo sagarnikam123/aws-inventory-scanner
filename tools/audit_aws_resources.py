@@ -1115,6 +1115,327 @@ def check_drift_cloudtrail_stale(account_dir, days_threshold):
 
 
 # ============================================================
+# 💰 COST CHECKS — Additional services
+# ============================================================
+
+def check_cost_sagemaker(account_dir, days_threshold):
+    """SageMaker endpoints running — very expensive if idle."""
+    findings = []
+    path = find_latest_inventory(account_dir, "sagemaker")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if not isinstance(region_data, dict):
+            continue
+        for ep in region_data.get("endpoints", []):
+            if ep.get("status") == "InService":
+                findings.append(finding(
+                    "cost", "SageMaker", region,
+                    ep.get("endpoint_name", "unknown"),
+                    "Inference endpoint running — verify active usage (expensive)",
+                    "medium",
+                    est_monthly_cost=100  # ponytail: conservative, ml instances $50-500+/mo
+                ))
+    return findings
+
+
+def check_cost_bedrock_provisioned(account_dir, days_threshold):
+    """Bedrock provisioned throughput left running."""
+    findings = []
+    path = find_latest_inventory(account_dir, "bedrock")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if not isinstance(region_data, dict):
+            continue
+        for pt in region_data.get("provisioned_throughputs", []):
+            if pt.get("status") in ("InService", "ACTIVE"):
+                units = pt.get("model_units", 0)
+                findings.append(finding(
+                    "cost", "Bedrock", region,
+                    pt.get("name", "unknown"),
+                    f"Provisioned throughput active ({units} model units) — verify needed",
+                    "high",
+                    est_monthly_cost=units * 500  # ponytail: rough, varies by model
+                ))
+    return findings
+
+
+def check_cost_dms_idle(account_dir, days_threshold):
+    """DMS replication instances running with no active tasks."""
+    findings = []
+    path = find_latest_inventory(account_dir, "dms")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if not isinstance(region_data, dict):
+            continue
+        instances = region_data.get("replication_instances", [])
+        tasks = region_data.get("replication_tasks", [])
+
+        # Build set of instance ARNs that have active tasks
+        active_instance_arns = {t.get("replication_instance_arn") for t in tasks if t.get("status") in ("running", "starting")}
+
+        for inst in instances:
+            if inst.get("arn") not in active_instance_arns and inst.get("status") == "available":
+                findings.append(finding(
+                    "cost", "DMS", region,
+                    inst.get("identifier", "unknown"),
+                    f"Replication instance running, no active tasks ({inst.get('instance_class', '?')})",
+                    "medium",
+                    est_monthly_cost=50  # ponytail: dms.t3.medium ~$50/mo
+                ))
+    return findings
+
+
+def check_cost_msk(account_dir, days_threshold):
+    """MSK clusters — always expensive, flag for verification."""
+    findings = []
+    path = find_latest_inventory(account_dir, "msk")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, clusters in data.get("regions", {}).items():
+        if not isinstance(clusters, list):
+            continue
+        for cluster in clusters:
+            if cluster.get("state") == "ACTIVE":
+                brokers = cluster.get("num_brokers", 0)
+                instance_type = cluster.get("broker_instance_type", "?")
+                storage = cluster.get("storage_gb_per_broker", 0)
+                # ponytail: kafka.m5.large ~$175/mo per broker + storage
+                est = brokers * 175
+                findings.append(finding(
+                    "cost", "MSK", region,
+                    cluster.get("cluster_name", "unknown"),
+                    f"{brokers}x {instance_type}, {storage}GB/broker — verify utilization",
+                    "info",
+                    est_monthly_cost=est
+                ))
+    return findings
+
+
+def check_cost_mwaa(account_dir, days_threshold):
+    """MWAA environments — expensive base cost."""
+    findings = []
+    path = find_latest_inventory(account_dir, "mwaa")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, envs in data.get("regions", {}).items():
+        if not isinstance(envs, list):
+            continue
+        for env in envs:
+            if env.get("status") == "AVAILABLE":
+                env_class = env.get("environment_class", "mw1.small")
+                # ponytail: mw1.small ~$0.49/hr=$360/mo, mw1.medium ~$720/mo
+                cost_map = {"mw1.small": 360, "mw1.medium": 720, "mw1.large": 1440}
+                est = cost_map.get(env_class, 360)
+                findings.append(finding(
+                    "cost", "MWAA", region,
+                    env.get("name", "unknown"),
+                    f"Airflow running ({env_class}) — verify DAGs active",
+                    "info",
+                    est_monthly_cost=est
+                ))
+    return findings
+
+
+def check_cost_glue_stale(account_dir, days_threshold):
+    """Glue jobs not run in months."""
+    findings = []
+    path = find_latest_inventory(account_dir, "glue")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if not isinstance(region_data, dict):
+            continue
+        for job in region_data.get("jobs", []):
+            last_mod = job.get("last_modified", job.get("created_at", ""))
+            if is_stale(last_mod, days_threshold):
+                age = days_ago(last_mod)
+                findings.append(finding(
+                    "cost", "Glue", region,
+                    job.get("name", "unknown"),
+                    f"Job not modified in {age} days — possibly abandoned",
+                    "low"
+                ))
+    return findings
+
+
+def check_cost_emr_no_autoterminate(account_dir, days_threshold):
+    """EMR clusters without auto-terminate."""
+    findings = []
+    path = find_latest_inventory(account_dir, "emr")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, clusters in data.get("regions", {}).items():
+        if not isinstance(clusters, list):
+            continue
+        for cluster in clusters:
+            if not cluster.get("auto_terminate", True) and cluster.get("state") in ("RUNNING", "WAITING"):
+                findings.append(finding(
+                    "cost", "EMR", region,
+                    cluster.get("name", cluster.get("cluster_id", "unknown")),
+                    "Auto-terminate disabled — will run (and charge) indefinitely",
+                    "medium",
+                    est_monthly_cost=200  # ponytail: varies wildly, conservative baseline
+                ))
+    return findings
+
+
+def check_cost_s3_no_lifecycle(account_dir, days_threshold):
+    """S3 buckets without lifecycle policy — infinite storage growth."""
+    findings = []
+    path = find_latest_inventory(account_dir, "s3")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    buckets = data.get("buckets", [])
+    for bucket in buckets:
+        lifecycle = bucket.get("lifecycle_rules", bucket.get("lifecycle", None))
+        size_gb = bucket.get("size_gb", 0)
+        if lifecycle is not None and not lifecycle and size_gb > 10:
+            findings.append(finding(
+                "cost", "S3", bucket.get("region", "global"),
+                bucket.get("name", "unknown"),
+                f"No lifecycle policy ({size_gb:.0f} GB) — storage grows indefinitely",
+                "low" if size_gb < 100 else "medium",
+                est_monthly_cost=round(size_gb * 0.023, 2)  # S3 standard rate
+            ))
+    return findings
+
+
+def check_cost_cloudfront_disabled(account_dir, days_threshold):
+    """CloudFront distributions that are disabled but still exist."""
+    findings = []
+    path = find_latest_inventory(account_dir, "cloudfront")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for dist in data.get("distributions", []):
+        if not dist.get("enabled", True):
+            findings.append(finding(
+                "cost", "CloudFront", "global",
+                f"{dist.get('distribution_id')} ({dist.get('comment', '') or dist.get('domain_name', '')})",
+                "Distribution disabled — can delete if no longer needed",
+                "low"
+            ))
+    return findings
+
+
+def check_cost_waf_empty(account_dir, days_threshold):
+    """WAF Web ACLs with 0 rules — paying base cost for nothing."""
+    findings = []
+    path = find_latest_inventory(account_dir, "waf")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, acls in data.get("regions", {}).items():
+        if not isinstance(acls, list):
+            continue
+        for acl in acls:
+            if acl.get("rule_count", 1) == 0:
+                findings.append(finding(
+                    "cost", "WAF", region,
+                    acl.get("name", "unknown"),
+                    "Web ACL with 0 rules — paying $5/mo base for nothing",
+                    "low",
+                    est_monthly_cost=5
+                ))
+    return findings
+
+
+def check_cost_elasticache(account_dir, days_threshold):
+    """ElastiCache clusters — flag for utilization review."""
+    findings = []
+    path = find_latest_inventory(account_dir, "elasticache")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if not isinstance(region_data, dict):
+            continue
+        for cluster in region_data.get("clusters", []):
+            node_type = cluster.get("node_type", "?")
+            num_nodes = cluster.get("num_nodes", 1)
+            if is_stale(cluster.get("created_at"), days_threshold):
+                findings.append(finding(
+                    "cost", "ElastiCache", region,
+                    cluster.get("cluster_id", "unknown"),
+                    f"{num_nodes}x {node_type} — old cluster, verify still needed",
+                    "info",
+                    est_monthly_cost=num_nodes * 25  # ponytail: cache.t3.micro ~$12, t3.medium ~$50
+                ))
+    return findings
+
+
+def check_cost_transit_gateway(account_dir, days_threshold):
+    """Transit Gateway attachments — per-hour + per-GB charges."""
+    findings = []
+    path = find_latest_inventory(account_dir, "transit-gateway")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if not isinstance(region_data, dict):
+            continue
+        attachments = region_data.get("attachments", [])
+        if attachments:
+            # $0.05/hr per attachment = ~$36/mo
+            est = len(attachments) * 36
+            findings.append(finding(
+                "cost", "Transit Gateway", region,
+                f"{len(attachments)} TGW attachments",
+                f"~${est}/mo ({len(attachments)} x $36/mo) — verify all needed",
+                "info",
+                est_monthly_cost=est
+            ))
+    return findings
+
+
+# ============================================================
 # ALL CHECKS REGISTRY
 # ============================================================
 
@@ -1145,6 +1466,18 @@ ALL_CHECKS = [
     check_cost_kinesis,
     check_cost_acm_unused,
     check_cost_ecs_scaled_zero,
+    check_cost_sagemaker,
+    check_cost_bedrock_provisioned,
+    check_cost_dms_idle,
+    check_cost_msk,
+    check_cost_mwaa,
+    check_cost_glue_stale,
+    check_cost_emr_no_autoterminate,
+    check_cost_s3_no_lifecycle,
+    check_cost_cloudfront_disabled,
+    check_cost_waf_empty,
+    check_cost_elasticache,
+    check_cost_transit_gateway,
     # Reliability
     check_reliability_rds,
     check_reliability_eks_version,
