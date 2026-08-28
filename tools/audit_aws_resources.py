@@ -1571,7 +1571,6 @@ def main():
         for check_fn in ALL_CHECKS:
             findings = check_fn(account_dir, args.days)
             for f in findings:
-                f["account_id"] = account_id
                 if severity_order.get(f.get("severity", "info"), 4) <= min_severity:
                     if args.category and f.get("category") != args.category:
                         continue
@@ -1583,8 +1582,8 @@ def main():
     # Always save JSON report to output/audit/
     output_data = {
         "generated": datetime.now(timezone.utc).isoformat(),
+        "account_id": account_ids,
         "staleness_threshold_days": args.days,
-        "accounts_scanned": len(account_dirs),
         "total_findings": len(all_findings),
         "estimated_monthly_waste_usd": round(total_est_savings, 2),
         "findings_by_severity": {
