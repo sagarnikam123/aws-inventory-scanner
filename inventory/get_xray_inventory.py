@@ -48,6 +48,10 @@ def scan_xray(session, regions, writer):
                         "insights_enabled": group.get('InsightsConfiguration', {}).get('InsightsEnabled', False),
                     })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    log_region_skip(region, SERVICE, str(e))
+                    writer.set_nested("regions", region, value={})
+                    continue
                 logger.warning(f"  {region}: Groups error — {e}")
 
             # Sampling rules
@@ -69,7 +73,8 @@ def scan_xray(session, regions, writer):
                         "version": rule.get('Version', 1),
                     })
             except Exception as e:
-                logger.warning(f"  {region}: Sampling rules error — {e}")
+                if not is_region_unsupported_error(e):
+                    logger.warning(f"  {region}: Sampling rules error — {e}")
 
             writer.set_nested("regions", region, value=region_data)
             total_groups += len(region_data["groups"])
