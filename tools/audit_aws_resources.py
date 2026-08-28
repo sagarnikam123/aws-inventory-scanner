@@ -1582,7 +1582,7 @@ def main():
     # Always save JSON report to output/audit/
     output_data = {
         "generated": datetime.now(timezone.utc).isoformat(),
-        "account_id": account_ids,
+        "account_id": account_id,
         "staleness_threshold_days": args.days,
         "total_findings": len(all_findings),
         "estimated_monthly_waste_usd": round(total_est_savings, 2),
@@ -1605,8 +1605,7 @@ def main():
     audit_dir = OUTPUT_DIR / "audit"
     audit_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    account_ids = sorted(d.name for d in account_dirs)[0]
-    audit_file = audit_dir / f"audit-report-{account_ids}-{timestamp}.json"
+    audit_file = audit_dir / f"audit-report-{account_id}-{timestamp}.json"
     with open(audit_file, 'w') as f:
         json.dump(output_data, f, indent=2, default=str, ensure_ascii=False)
     print(f"  📄 Saved: {audit_file}")
