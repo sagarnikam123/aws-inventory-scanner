@@ -32,12 +32,19 @@ def scan_lambda(session, regions, writer):
 
         try:
             lam = session.client('lambda', region_name=region, config=BOTO_CONFIG)
+            cw = session.client('cloudwatch', region_name=region, config=BOTO_CONFIG)
+
+            # Time window for invocation check (last 30 days)
+            from datetime import datetime, timezone, timedelta
+            end_time = datetime.now(timezone.utc)
+            start_time = end_time - timedelta(days=30)
 
             paginator = lam.get_paginator('list_functions')
             for page in paginator.paginate():
                 for fn in page.get('Functions', []):
-                    region_data.append({
-                        "name": fn['FunctionName'],
+                    fn_name = fn['FunctionName']
+                    entry = {
+                        "name": fn_name,
                         "runtime": fn.get('Runtime', 'N/A'),
                         "memory_mb": fn.get('MemorySize', 0),
                         "timeout_sec": fn.get('Timeout', 0),
@@ -45,7 +52,31 @@ def scan_lambda(session, regions, writer):
                         "handler": fn.get('Handler', ''),
                         "last_modified": fn.get('LastModified', ''),
                         "architectures": fn.get('Architectures', []),
-                    })
+                        "last_invocation_time": None,
+                        "invocations_last_30d": 0,
+                    }
+
+                    # Query CloudWatch for last invocation
+                    try:
+                        resp = cw.get_metric_statistics(
+                            Namespace='AWS/Lambda',
+                            MetricName='Invocations',
+                            Dimensions=[{'Name': 'FunctionName', 'Value': fn_name}],
+                            StartTime=start_time,
+                            EndTime=end_time,
+                            Period=86400,  # 1 day granularity
+                            Statistics=['Sum'],
+                        )
+                        datapoints = resp.get('Datapoints', [])
+                        if datapoints:
+                            # Sort by timestamp descending
+                            datapoints.sort(key=lambda d: d['Timestamp'], reverse=True)
+                            entry["last_invocation_time"] = datapoints[0]['Timestamp'].isoformat()
+                            entry["invocations_last_30d"] = int(sum(d['Sum'] for d in datapoints))
+                    except Exception:
+                        pass  # ponytail: CloudWatch throttle — skip gracefully
+
+                    region_data.append(entry)
 
         except Exception as e:
             if is_region_unsupported_error(e):

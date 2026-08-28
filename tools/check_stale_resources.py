@@ -508,7 +508,7 @@ def check_cost_sqs_dead(account_dir, days_threshold):
 
 
 def check_cost_lambda_stale(account_dir, days_threshold):
-    """Lambda functions not modified in N+ days."""
+    """Lambda functions not invoked or modified in N+ days."""
     findings = []
     path = find_latest_inventory(account_dir, "lambda")
     if not path:
@@ -520,15 +520,32 @@ def check_cost_lambda_stale(account_dir, days_threshold):
     for region, region_data in data.get("regions", {}).items():
         functions = region_data if isinstance(region_data, list) else region_data.get("functions", [])
         for fn in functions:
-            last_mod = fn.get("last_modified", "")
-            if is_stale(last_mod, days_threshold):
+            fn_name = fn.get("name", fn.get("function_name", "unknown"))
+            last_invoked = fn.get("last_invocation_time")
+            invocations = fn.get("invocations_last_30d", None)
+
+            # Best signal: 0 invocations in last 30 days
+            if invocations is not None and invocations == 0:
+                last_mod = fn.get("last_modified", "")
                 age = days_ago(last_mod)
+                issue = "0 invocations in 30 days"
+                if age:
+                    issue += f", code {age} days old"
                 findings.append(finding(
-                    "cost", "Lambda", region,
-                    fn.get("name", fn.get("function_name", "unknown")),
-                    f"Not modified in {age} days — possibly unused",
-                    "low"
+                    "cost", "Lambda", region, fn_name,
+                    issue + " — dead function",
+                    "medium"
                 ))
+            # Fallback: just check last_modified if no invocation data
+            elif invocations is None:
+                last_mod = fn.get("last_modified", "")
+                if is_stale(last_mod, days_threshold):
+                    age = days_ago(last_mod)
+                    findings.append(finding(
+                        "cost", "Lambda", region, fn_name,
+                        f"Not modified in {age} days — possibly unused",
+                        "low"
+                    ))
     return findings
 
 
