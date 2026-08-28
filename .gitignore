@@ -1,0 +1,25 @@
+# Auto-generated inventory outputs
+output/
+
+# Private config (contains real account IDs and profile names)
+conf/accounts.yaml
+
+# Analysis files (may contain private account/org data)
+analysis/
+
+# Local tooling (machine-specific, regenerated on setup)
+.kiro/
+.serena/
+graphify-out/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
