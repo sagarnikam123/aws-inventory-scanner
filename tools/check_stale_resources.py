@@ -1215,29 +1215,39 @@ def main():
     # Calculate estimated savings
     total_est_savings = sum(f.get("est_monthly_waste_usd", 0) for f in all_findings)
 
+    # Always save JSON report to output/audit/
+    output_data = {
+        "generated": datetime.now(timezone.utc).isoformat(),
+        "staleness_threshold_days": args.days,
+        "accounts_scanned": len(account_dirs),
+        "total_findings": len(all_findings),
+        "estimated_monthly_waste_usd": round(total_est_savings, 2),
+        "findings_by_severity": {
+            s: sum(1 for f in all_findings if f["severity"] == s)
+            for s in severity_order if sum(1 for f in all_findings if f["severity"] == s) > 0
+        },
+        "findings_by_category": {
+            c: sum(1 for f in all_findings if f["category"] == c)
+            for c in ["security", "cost", "reliability", "drift"]
+            if sum(1 for f in all_findings if f["category"] == c) > 0
+        },
+        "top_cost_savings": sorted(
+            [f for f in all_findings if f.get("est_monthly_waste_usd", 0) > 0],
+            key=lambda x: x["est_monthly_waste_usd"], reverse=True
+        )[:20],
+        "findings": all_findings,
+    }
+
+    audit_dir = OUTPUT_DIR / "audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    audit_file = audit_dir / f"audit-report-{timestamp}.json"
+    with open(audit_file, 'w') as f:
+        json.dump(output_data, f, indent=2, default=str)
+    print(f"  📄 Saved: {audit_file}")
+
     if args.json:
-        output = {
-            "generated": datetime.now(timezone.utc).isoformat(),
-            "staleness_threshold_days": args.days,
-            "accounts_scanned": len(account_dirs),
-            "total_findings": len(all_findings),
-            "estimated_monthly_waste_usd": round(total_est_savings, 2),
-            "findings_by_severity": {
-                s: sum(1 for f in all_findings if f["severity"] == s)
-                for s in severity_order if sum(1 for f in all_findings if f["severity"] == s) > 0
-            },
-            "findings_by_category": {
-                c: sum(1 for f in all_findings if f["category"] == c)
-                for c in ["security", "cost", "reliability", "drift"]
-                if sum(1 for f in all_findings if f["category"] == c) > 0
-            },
-            "top_cost_savings": sorted(
-                [f for f in all_findings if f.get("est_monthly_waste_usd", 0) > 0],
-                key=lambda x: x["est_monthly_waste_usd"], reverse=True
-            )[:20],
-            "findings": all_findings,
-        }
-        print(json.dumps(output, indent=2, default=str))
+        print(json.dumps(output_data, indent=2, default=str))
     else:
         # Console report
         print()
