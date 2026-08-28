@@ -63,6 +63,10 @@ def scan_cloudtrail(session, regions, writer):
                         "latest_delivery_time": status.get('LatestDeliveryTime', ''),
                     })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    log_region_skip(region, SERVICE, str(e))
+                    writer.set_nested("regions", region, value={})
+                    continue
                 logger.warning(f"  {region}: Trails error — {e}")
 
             # Event Data Stores (CloudTrail Lake)
