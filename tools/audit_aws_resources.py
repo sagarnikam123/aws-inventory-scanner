@@ -1536,8 +1536,8 @@ def main():
     parser = argparse.ArgumentParser(description='AWS Resource Audit — Security, Cost, Reliability & Drift')
     parser.add_argument('--account-id', '-a', default=None,
                         help='Check specific account (default: all in output/)')
-    parser.add_argument('--days', '-d', type=int, default=180,
-                        help='Staleness threshold in days (default: 180)')
+    parser.add_argument('--days', '-d', type=int, default=90,
+                        help='Staleness threshold in days (default: 90)')
     parser.add_argument('--json', action='store_true',
                         help='Output as JSON (for presentations/reports)')
     parser.add_argument('--severity', '-s', default=None,
