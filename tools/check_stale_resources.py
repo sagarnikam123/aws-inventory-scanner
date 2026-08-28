@@ -644,6 +644,46 @@ def check_cost_elb_idle(account_dir, days_threshold):
     return findings
 
 
+def check_cost_ebs_waste(account_dir, days_threshold):
+    """Unattached EBS volumes and unassociated Elastic IPs."""
+    findings = []
+    path = find_latest_inventory(account_dir, "ebs")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if not isinstance(region_data, dict):
+            continue
+        # Unattached volumes
+        for vol in region_data.get("unattached_volumes", []):
+            size = vol.get("size_gb", 0)
+            # ponytail: gp3=$0.08, gp2=$0.10, io1=$0.125, st1=$0.045, sc1=$0.015 per GB/mo
+            cost_map = {"gp3": 0.08, "gp2": 0.10, "io1": 0.125, "io2": 0.125, "st1": 0.045, "sc1": 0.015}
+            rate = cost_map.get(vol.get("volume_type", "gp3"), 0.08)
+            monthly = round(size * rate, 2)
+            findings.append(finding(
+                "cost", "EBS", region,
+                f"{vol.get('volume_id')} ({vol.get('name') or 'unnamed'})",
+                f"Unattached {vol.get('volume_type', '?')} {size} GB — pure waste",
+                "medium" if monthly > 5 else "low",
+                est_monthly_cost=monthly
+            ))
+        # Unassociated Elastic IPs
+        for eip in region_data.get("elastic_ips", []):
+            if not eip.get("associated", True):
+                findings.append(finding(
+                    "cost", "Elastic IP", region,
+                    eip.get("public_ip", "unknown"),
+                    "Unassociated EIP — $3.65/mo waste",
+                    "low",
+                    est_monthly_cost=3.65
+                ))
+    return findings
+
+
 def check_cost_kinesis(account_dir, days_threshold):
     """Kinesis provisioned streams that may be unused."""
     findings = []
@@ -1084,6 +1124,7 @@ ALL_CHECKS = [
     check_cost_ecr_empty,
     check_cost_dynamodb_overprovisioned,
     check_cost_elb_idle,
+    check_cost_ebs_waste,
     check_cost_kinesis,
     check_cost_acm_unused,
     check_cost_ecs_scaled_zero,
