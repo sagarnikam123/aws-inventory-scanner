@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common import (
-    logger, BOTO_CONFIG, get_accounts, get_regions, create_session,
+    logger, BOTO_CONFIG, get_accounts, create_session,
     get_output_dir, get_timestamp, add_common_args,
     create_session_with_identity, is_region_unsupported_error, log_region_skip,
     IncrementalWriter, make_output_filename,
@@ -28,78 +28,70 @@ from common import (
 )
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SERVICE = "bedrock"
 
+# Regions where Amazon Bedrock is actually available (as of 2026).
+# ponytail: pinned list avoids probing 33 regions where Bedrock doesn't exist.
+# Upgrade path: if AWS adds a region, add it here or pass -r explicitly.
+BEDROCK_REGIONS = [
+    "us-east-1", "us-east-2", "us-west-2",
+    "ap-south-1", "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
+    "ap-southeast-1", "ap-southeast-2",
+    "ca-central-1",
+    "eu-central-1", "eu-west-1", "eu-west-2", "eu-west-3", "eu-north-1",
+    "sa-east-1",
+]
 
-def _safe_list(client, method, key, **kwargs):
-    """Paginate or single-call a list method, return items or empty list on error."""
+
+def scan_region(session, region):
+    """Scan Bedrock resources in a single region. Returns (region_data, counts)."""
+    counts = {"custom_models": 0, "provisioned_throughputs": 0, "agents": 0, "knowledge_bases": 0, "guardrails": 0}
+    region_data = {}
     try:
-        items = []
-        if hasattr(client.get_paginator, '__call__'):
-            try:
-                paginator = client.get_paginator(method)
-                for page in paginator.paginate(**kwargs):
-                    items.extend(page.get(key, []))
-                return items
-            except client.exceptions.from_code('UnknownOperationException'):
-                pass
-            except Exception:
-                pass
-        # Fallback: single call
-        resp = getattr(client, method)(**kwargs)
-        return resp.get(key, [])
-    except Exception:
-        return []
+        client = session.client('bedrock', region_name=region, config=BOTO_CONFIG)
 
-
-def scan_bedrock(session, regions, writer):
-    """Scan Bedrock resources across all specified regions."""
-    total = {"custom_models": 0, "provisioned_throughputs": 0, "agents": 0, "knowledge_bases": 0, "guardrails": 0}
-
-    for region in regions:
+        # Custom models
+        custom_models = []
         try:
-            client = session.client('bedrock', region_name=region, config=BOTO_CONFIG)
-            region_data = {}
+            resp = client.list_custom_models()
+            for m in resp.get('modelSummaries', []):
+                custom_models.append({
+                    "model_name": m.get('modelName', 'N/A'),
+                    "model_arn": m.get('modelArn', 'N/A'),
+                    "base_model_id": m.get('baseModelIdentifier', 'N/A'),
+                    "creation_time": m.get('creationTime', ''),
+                })
+        except Exception:
+            pass
+        region_data["custom_models"] = custom_models
+        counts["custom_models"] = len(custom_models)
 
-            # Custom models
-            custom_models = []
-            try:
-                resp = client.list_custom_models()
-                for m in resp.get('modelSummaries', []):
-                    custom_models.append({
-                        "model_name": m.get('modelName', 'N/A'),
-                        "model_arn": m.get('modelArn', 'N/A'),
-                        "base_model_id": m.get('baseModelIdentifier', 'N/A'),
-                        "creation_time": m.get('creationTime', ''),
-                    })
-            except Exception:
-                pass
-            region_data["custom_models"] = custom_models
-            total["custom_models"] += len(custom_models)
+        # Provisioned throughputs
+        provisioned = []
+        try:
+            resp = client.list_provisioned_model_throughputs()
+            for pt in resp.get('provisionedModelSummaries', []):
+                provisioned.append({
+                    "name": pt.get('provisionedModelName', 'N/A'),
+                    "arn": pt.get('provisionedModelArn', 'N/A'),
+                    "model_arn": pt.get('modelArn', 'N/A'),
+                    "status": pt.get('status', 'N/A'),
+                    "model_units": pt.get('desiredModelUnits', 0),
+                    "creation_time": pt.get('creationTime', ''),
+                })
+        except Exception:
+            pass
+        region_data["provisioned_throughputs"] = provisioned
+        counts["provisioned_throughputs"] = len(provisioned)
 
-            # Provisioned throughputs
-            provisioned = []
+        # Agents + Knowledge bases (both use bedrock-agent client — create once)
+        agents = []
+        knowledge_bases = []
+        try:
+            agent_client = session.client('bedrock-agent', region_name=region, config=BOTO_CONFIG)
             try:
-                resp = client.list_provisioned_model_throughputs()
-                for pt in resp.get('provisionedModelSummaries', []):
-                    provisioned.append({
-                        "name": pt.get('provisionedModelName', 'N/A'),
-                        "arn": pt.get('provisionedModelArn', 'N/A'),
-                        "model_arn": pt.get('modelArn', 'N/A'),
-                        "status": pt.get('status', 'N/A'),
-                        "model_units": pt.get('desiredModelUnits', 0),
-                        "creation_time": pt.get('creationTime', ''),
-                    })
-            except Exception:
-                pass
-            region_data["provisioned_throughputs"] = provisioned
-            total["provisioned_throughputs"] += len(provisioned)
-
-            # Agents (Bedrock AgentCore)
-            agents = []
-            try:
-                agent_client = session.client('bedrock-agent', region_name=region, config=BOTO_CONFIG)
                 resp = agent_client.list_agents()
                 for a in resp.get('agentSummaries', []):
                     agents.append({
@@ -110,13 +102,7 @@ def scan_bedrock(session, regions, writer):
                     })
             except Exception:
                 pass
-            region_data["agents"] = agents
-            total["agents"] += len(agents)
-
-            # Knowledge bases
-            knowledge_bases = []
             try:
-                agent_client = session.client('bedrock-agent', region_name=region, config=BOTO_CONFIG)
                 resp = agent_client.list_knowledge_bases()
                 for kb in resp.get('knowledgeBaseSummaries', []):
                     knowledge_bases.append({
@@ -127,39 +113,64 @@ def scan_bedrock(session, regions, writer):
                     })
             except Exception:
                 pass
-            region_data["knowledge_bases"] = knowledge_bases
-            total["knowledge_bases"] += len(knowledge_bases)
+        except Exception:
+            pass
+        region_data["agents"] = agents
+        counts["agents"] = len(agents)
+        region_data["knowledge_bases"] = knowledge_bases
+        counts["knowledge_bases"] = len(knowledge_bases)
 
-            # Guardrails
-            guardrails = []
+        # Guardrails
+        guardrails = []
+        try:
+            resp = client.list_guardrails()
+            for g in resp.get('guardrails', []):
+                guardrails.append({
+                    "guardrail_id": g.get('id', 'N/A'),
+                    "name": g.get('name', 'N/A'),
+                    "status": g.get('status', 'N/A'),
+                    "version": g.get('version', 'N/A'),
+                    "created_at": g.get('createdAt', ''),
+                })
+        except Exception:
+            pass
+        region_data["guardrails"] = guardrails
+        counts["guardrails"] = len(guardrails)
+
+    except Exception as e:
+        if is_region_unsupported_error(e):
+            log_region_skip(region, SERVICE, str(e))
+        else:
+            logger.warning(f"  {region}: Error — {e}")
+        return {}, counts
+
+    return region_data, counts
+
+
+def scan_bedrock(session, regions, writer):
+    """Scan Bedrock resources across all regions in parallel."""
+    total = {"custom_models": 0, "provisioned_throughputs": 0, "agents": 0, "knowledge_bases": 0, "guardrails": 0}
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(scan_region, session, region): region for region in regions}
+        for future in as_completed(futures):
+            region = futures[future]
             try:
-                resp = client.list_guardrails()
-                for g in resp.get('guardrails', []):
-                    guardrails.append({
-                        "guardrail_id": g.get('id', 'N/A'),
-                        "name": g.get('name', 'N/A'),
-                        "status": g.get('status', 'N/A'),
-                        "version": g.get('version', 'N/A'),
-                        "created_at": g.get('createdAt', ''),
-                    })
-            except Exception:
-                pass
-            region_data["guardrails"] = guardrails
-            total["guardrails"] += len(guardrails)
+                region_data, counts = future.result()
+            except Exception as e:
+                logger.warning(f"  {region}: worker error — {e}")
+                continue
 
+            for k in total:
+                total[k] += counts.get(k, 0)
+
+            # Flush per-region (thread-safe: single writer, one call)
             writer.set_nested("regions", region, value=region_data)
 
-            count = len(custom_models) + len(provisioned) + len(agents) + len(knowledge_bases) + len(guardrails)
+            count = sum(counts.values())
             if count:
-                logger.info(f"  {region}: {len(custom_models)} models, {len(provisioned)} provisioned, "
-                           f"{len(agents)} agents, {len(knowledge_bases)} KBs, {len(guardrails)} guardrails")
-
-        except Exception as e:
-            if is_region_unsupported_error(e):
-                log_region_skip(region, SERVICE, str(e))
-            else:
-                logger.warning(f"  {region}: Error — {e}")
-            writer.set_nested("regions", region, value={})
+                logger.info(f"  {region}: {counts['custom_models']} models, {counts['provisioned_throughputs']} provisioned, "
+                           f"{counts['agents']} agents, {counts['knowledge_bases']} KBs, {counts['guardrails']} guardrails")
 
     return total
 
@@ -170,7 +181,7 @@ def main():
     args = parser.parse_args()
 
     accounts = get_accounts(args.account)
-    regions = [args.region] if args.region else get_regions('bedrock')
+    regions = [args.region] if args.region else BEDROCK_REGIONS
     timestamp = get_timestamp()
 
     if args.profile:
