@@ -279,6 +279,43 @@ def log_region_skip(region: str, service: str, error: str = None):
         logger.debug(f"  ⏭️  {region}: {service} not supported")
 
 
+def scan_regions_parallel(session, regions, writer, scan_region_fn,
+                          log_fn=None, max_workers=8):
+    """Run scan_region_fn(session, region) across regions in parallel.
+
+    scan_region_fn must return (region_data: dict|list, counts: dict).
+    Empty region_data (falsy) is skipped. Per-region results are flushed
+    to writer.set_nested('regions', region, ...) as each future completes
+    (crash-safe). Returns aggregated totals dict summed across all counts.
+
+    log_fn(region, counts) -> optional custom per-region log line.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    totals = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(scan_region_fn, session, r): r for r in regions}
+        for future in as_completed(futures):
+            region = futures[future]
+            try:
+                region_data, counts = future.result()
+            except Exception as e:
+                logger.warning(f"  {region}: worker error — {e}")
+                continue
+
+            for k, v in (counts or {}).items():
+                totals[k] = totals.get(k, 0) + v
+
+            if region_data:
+                writer.set_nested('regions', region, value=region_data)
+                if log_fn:
+                    log_fn(region, counts)
+                else:
+                    summary = ", ".join(f"{v} {k}" for k, v in counts.items() if v)
+                    if summary:
+                        logger.info(f"  {region}: {summary}")
+    return totals
+
+
 def format_elapsed(seconds: float) -> str:
     """Format elapsed seconds into a human-readable string."""
     if seconds < 60:

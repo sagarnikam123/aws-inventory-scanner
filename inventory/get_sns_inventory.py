@@ -19,73 +19,69 @@ from common import (
     get_output_dir, get_timestamp, add_common_args,
     create_session_with_identity, is_region_unsupported_error,
     IncrementalWriter, make_output_filename,
-    run_with_timer,
+    run_with_timer, scan_regions_parallel,
 )
 
 
+def scan_region(session, region):
+    """Scan SNS topics + subscriptions in one region. Returns (region_data, counts)."""
+    counts = {"topics": 0, "subscriptions": 0}
+    region_data = {"topics": []}
+    try:
+        sns = session.client('sns', region_name=region, config=BOTO_CONFIG)
+
+        paginator = sns.get_paginator('list_topics')
+        for page in paginator.paginate():
+            for topic in page.get('Topics', []):
+                topic_arn = topic['TopicArn']
+                topic_name = topic_arn.split(':')[-1]
+
+                try:
+                    attrs = sns.get_topic_attributes(TopicArn=topic_arn).get('Attributes', {})
+                except Exception:
+                    attrs = {}
+
+                subs = []
+                try:
+                    sub_paginator = sns.get_paginator('list_subscriptions_by_topic')
+                    for sub_page in sub_paginator.paginate(TopicArn=topic_arn):
+                        for sub in sub_page.get('Subscriptions', []):
+                            subs.append({
+                                "protocol": sub.get('Protocol', ''),
+                                "endpoint": sub.get('Endpoint', ''),
+                                "subscription_arn": sub.get('SubscriptionArn', ''),
+                            })
+                except Exception:
+                    pass
+
+                region_data["topics"].append({
+                    "name": topic_name,
+                    "arn": topic_arn,
+                    "display_name": attrs.get('DisplayName', ''),
+                    "subscriptions_confirmed": int(attrs.get('SubscriptionsConfirmed', 0)),
+                    "subscriptions_pending": int(attrs.get('SubscriptionsPending', 0)),
+                    "kms_key_id": attrs.get('KmsMasterKeyId', ''),
+                    "fifo": attrs.get('FifoTopic', 'false') == 'true',
+                    "subscriptions": subs,
+                })
+                counts["subscriptions"] += len(subs)
+
+    except Exception as e:
+        if is_region_unsupported_error(e):
+            return {}, counts
+        logger.warning(f"  {region}: Error — {e}")
+        return {}, counts
+
+    counts["topics"] = len(region_data["topics"])
+    return region_data, counts
+
+
 def scan_sns(session, regions, writer):
-    """Scan SNS topics and subscriptions, writing incrementally per region."""
-    totals = {"topics": 0, "subscriptions": 0}
-
-    for region in regions:
-        region_data = {"topics": []}
-
-        try:
-            sns = session.client('sns', region_name=region, config=BOTO_CONFIG)
-
-            # List all topics
-            paginator = sns.get_paginator('list_topics')
-            for page in paginator.paginate():
-                for topic in page.get('Topics', []):
-                    topic_arn = topic['TopicArn']
-                    topic_name = topic_arn.split(':')[-1]
-
-                    # Get topic attributes
-                    try:
-                        attrs = sns.get_topic_attributes(TopicArn=topic_arn).get('Attributes', {})
-                    except Exception:
-                        attrs = {}
-
-                    # Get subscriptions for this topic
-                    subs = []
-                    try:
-                        sub_paginator = sns.get_paginator('list_subscriptions_by_topic')
-                        for sub_page in sub_paginator.paginate(TopicArn=topic_arn):
-                            for sub in sub_page.get('Subscriptions', []):
-                                subs.append({
-                                    "protocol": sub.get('Protocol', ''),
-                                    "endpoint": sub.get('Endpoint', ''),
-                                    "subscription_arn": sub.get('SubscriptionArn', ''),
-                                })
-                    except Exception:
-                        pass
-
-                    region_data["topics"].append({
-                        "name": topic_name,
-                        "arn": topic_arn,
-                        "display_name": attrs.get('DisplayName', ''),
-                        "subscriptions_confirmed": int(attrs.get('SubscriptionsConfirmed', 0)),
-                        "subscriptions_pending": int(attrs.get('SubscriptionsPending', 0)),
-                        "kms_key_id": attrs.get('KmsMasterKeyId', ''),
-                        "fifo": attrs.get('FifoTopic', 'false') == 'true',
-                        "subscriptions": subs,
-                    })
-                    totals["subscriptions"] += len(subs)
-
-        except Exception as e:
-            if is_region_unsupported_error(e):
-                continue
-            logger.warning(f"  {region}: Error — {e}")
-            continue
-
-        count = len(region_data["topics"])
-        if count > 0:
-            logger.info(f"  {region}: {count} topic(s)")
-            writer.set_nested('regions', region, value=region_data)
-
-        totals["topics"] += count
-
-    return totals
+    """Scan SNS across all regions in parallel, writing incrementally per region."""
+    return scan_regions_parallel(
+        session, regions, writer, scan_region,
+        log_fn=lambda region, c: logger.info(f"  {region}: {c['topics']} topic(s)"),
+    )
 
 
 def main():
@@ -113,10 +109,9 @@ def main():
 
         logger.info(f"\n🔍 {name} ({account_id})")
 
-        if not args.profile:
-            session = account.get("_session") or create_session(profile)
-            if not session:
-                continue
+        session = account.get("_session") or create_session(profile)
+        if not session:
+            continue
 
         output_dir = get_output_dir(account_id, "sns")
         writer = IncrementalWriter(output_dir, make_output_filename("sns", account_id, timestamp))
