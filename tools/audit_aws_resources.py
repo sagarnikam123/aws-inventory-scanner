@@ -10,12 +10,13 @@ Categories:
   🧹 DRIFT/HYGIENE — Untagged resources, disabled rules, misconfiguration
 
 Usage:
-    python tools/check_stale_resources.py                              # all accounts
-    python tools/check_stale_resources.py --account-id 111111111111    # specific account
-    python tools/check_stale_resources.py --days 90                    # staleness threshold
-    python tools/check_stale_resources.py --category security          # filter by category
-    python tools/check_stale_resources.py --json                       # JSON output
-    python tools/check_stale_resources.py --json > audit-report.json   # save for presentation
+    python tools/audit_aws_resources.py                                 # audit all accounts in output/
+    python tools/audit_aws_resources.py -a 111111111111                 # specific account
+    python tools/audit_aws_resources.py --days 90                       # staleness threshold
+    python tools/audit_aws_resources.py --category security             # filter by category
+    python tools/audit_aws_resources.py --json                          # JSON to stdout
+    python tools/audit_aws_resources.py -a 111111111111 --live-pricing -p myprofile
+                                                                        # real Pricing API cost rates
 """
 
 import sys
@@ -111,6 +112,39 @@ def finding(category, service, region, resource, issue, severity, est_monthly_co
     if est_monthly_cost is not None:
         f["est_monthly_waste_usd"] = est_monthly_cost
     return f
+
+
+# ============================================================
+# Live pricing (optional) — filled by main() when --live-pricing is set.
+# When off, checks fall back to the hardcoded rates below.
+# ============================================================
+
+_SESSION = None  # boto3 session when live pricing enabled, else None
+
+# Fallback per-GB-month EBS rates (us-east-1 list prices)
+EBS_FALLBACK_RATE = {"gp3": 0.08, "gp2": 0.10, "io1": 0.125, "io2": 0.125, "st1": 0.045, "sc1": 0.015}
+HOURS_PER_MONTH = 730
+
+
+def ebs_rate(region, volume_type):
+    """Per-GB-month price for an EBS volume type — live if available, else fallback."""
+    vt = volume_type or "gp3"
+    if _SESSION is not None:
+        from common import get_ebs_gb_month_price
+        price = get_ebs_gb_month_price(_SESSION, region, vt)
+        if price is not None:
+            return price
+    return EBS_FALLBACK_RATE.get(vt, 0.08)
+
+
+def ec2_monthly(region, instance_type):
+    """Monthly on-demand price for an EC2 instance type — live only (None if unavailable)."""
+    if _SESSION is not None and instance_type:
+        from common import get_ec2_hourly_price
+        hourly = get_ec2_hourly_price(_SESSION, region, instance_type)
+        if hourly is not None:
+            return round(hourly * HOURS_PER_MONTH, 2)
+    return None
 
 
 # ============================================================
@@ -677,9 +711,7 @@ def check_cost_ebs_waste(account_dir, days_threshold):
         # Unattached volumes
         for vol in region_data.get("unattached_volumes", []):
             size = vol.get("size_gb", 0)
-            # ponytail: gp3=$0.08, gp2=$0.10, io1=$0.125, st1=$0.045, sc1=$0.015 per GB/mo
-            cost_map = {"gp3": 0.08, "gp2": 0.10, "io1": 0.125, "io2": 0.125, "st1": 0.045, "sc1": 0.015}
-            rate = cost_map.get(vol.get("volume_type", "gp3"), 0.08)
+            rate = ebs_rate(region, vol.get("volume_type", "gp3"))
             monthly = round(size * rate, 2)
             findings.append(finding(
                 "cost", "EBS", region,
@@ -1546,7 +1578,25 @@ def main():
     parser.add_argument('--category', '-c', default=None,
                         choices=['security', 'cost', 'reliability', 'drift'],
                         help='Filter by category')
+    parser.add_argument('--live-pricing', action='store_true',
+                        help='Use live AWS Pricing API for cost estimates (needs --profile)')
+    parser.add_argument('--profile', '-p', default=None,
+                        help='AWS profile for --live-pricing (Pricing API is free/read-only)')
     args = parser.parse_args()
+
+    # Optional: live pricing via AWS Pricing API
+    if args.live_pricing:
+        if not args.profile:
+            print("ERROR: --live-pricing requires --profile")
+            sys.exit(1)
+        global _SESSION
+        sys.path.insert(0, str(ROOT_DIR))
+        from common import create_session
+        _SESSION = create_session(args.profile)
+        if _SESSION is None:
+            print(f"ERROR: could not create session for profile {args.profile}")
+            sys.exit(1)
+        print(f"  💲 Live pricing enabled via profile {args.profile}")
 
     # Find account directories
     if args.account_id:

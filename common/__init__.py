@@ -8,4 +8,5 @@ from common.common import (
     create_session_with_identity, add_common_args,
     is_region_unsupported_error, log_region_skip,
     format_elapsed, run_with_timer,
+    get_price, get_ebs_gb_month_price, get_ec2_hourly_price,
 )

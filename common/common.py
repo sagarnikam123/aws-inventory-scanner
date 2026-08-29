@@ -292,6 +292,91 @@ def format_elapsed(seconds: float) -> str:
         return f"{h}h {m}m {s}s"
 
 
+# ============================================================
+# AWS Pricing API — live list prices (cached)
+# ============================================================
+
+# Pricing API only has endpoints in us-east-1 and ap-south-1
+_PRICING_ENDPOINT_REGION = "us-east-1"
+# Module-level cache: {(service_code, cache_key): price_float}
+_PRICE_CACHE = {}
+_pricing_client = None
+
+
+def _get_pricing_client(session: boto3.Session):
+    """Lazily create a shared pricing client (cached per process)."""
+    global _pricing_client
+    if _pricing_client is None:
+        _pricing_client = session.client('pricing', region_name=_PRICING_ENDPOINT_REGION, config=BOTO_CONFIG)
+    return _pricing_client
+
+
+def _extract_price(price_list_item: str) -> Optional[float]:
+    """Pull the USD OnDemand price from a Pricing API PriceList JSON string."""
+    try:
+        data = json.loads(price_list_item)
+        on_demand = data.get("terms", {}).get("OnDemand", {})
+        for term in on_demand.values():
+            for dim in term.get("priceDimensions", {}).values():
+                usd = dim.get("pricePerUnit", {}).get("USD")
+                if usd is not None:
+                    return float(usd)
+    except Exception:
+        pass
+    return None
+
+
+def get_price(session: boto3.Session, service_code: str, filters: List[Dict[str, str]],
+              cache_key: str = None) -> Optional[float]:
+    """Query the AWS Pricing API for the OnDemand USD price of a resource.
+
+    Returns price per unit (e.g. per GB-month, per hour) or None if unavailable.
+    Results are cached per process to avoid repeat calls.
+
+    filters: list of {"Field": ..., "Value": ...} — combined as TERM_MATCH.
+    cache_key: optional explicit cache key; defaults to service+filter values.
+    """
+    if cache_key is None:
+        cache_key = service_code + "|" + "|".join(f"{f['Field']}={f['Value']}" for f in filters)
+
+    if cache_key in _PRICE_CACHE:
+        return _PRICE_CACHE[cache_key]
+
+    try:
+        client = _get_pricing_client(session)
+        api_filters = [{"Type": "TERM_MATCH", "Field": f["Field"], "Value": f["Value"]} for f in filters]
+        resp = client.get_products(ServiceCode=service_code, Filters=api_filters, MaxResults=1)
+        price_list = resp.get("PriceList", [])
+        price = _extract_price(price_list[0]) if price_list else None
+    except Exception:
+        price = None
+
+    _PRICE_CACHE[cache_key] = price
+    return price
+
+
+def get_ebs_gb_month_price(session, region: str, volume_type: str = "gp3") -> Optional[float]:
+    """Price per GB-month for an EBS volume type in a region."""
+    return get_price(session, "AmazonEC2", [
+        {"Field": "productFamily", "Value": "Storage"},
+        {"Field": "volumeApiName", "Value": volume_type},
+        {"Field": "regionCode", "Value": region},
+    ])
+
+
+def get_ec2_hourly_price(session, region: str, instance_type: str,
+                         os: str = "Linux") -> Optional[float]:
+    """On-Demand hourly price for an EC2 instance type in a region (shared tenancy)."""
+    return get_price(session, "AmazonEC2", [
+        {"Field": "instanceType", "Value": instance_type},
+        {"Field": "regionCode", "Value": region},
+        {"Field": "operatingSystem", "Value": os},
+        {"Field": "tenancy", "Value": "Shared"},
+        {"Field": "preInstalledSw", "Value": "NA"},
+        {"Field": "capacitystatus", "Value": "Used"},
+    ])
+
+
 def run_with_timer(main_func):
     """Wrap a main() function with elapsed time logging."""
     start = time.time()
