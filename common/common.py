@@ -309,4 +309,4 @@ def run_with_timer(main_func):
             elapsed = time.time() - start
             script_name = Path(sys.argv[0]).name
             status = "completed" if success else "failed after"
-            logger.info(f"\n⏱️  {script_name} {status} {format_elapsed(elapsed)}")
+            logger.info(f"⏱️  {script_name} {status} {format_elapsed(elapsed)}")
