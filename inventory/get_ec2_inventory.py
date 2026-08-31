@@ -140,7 +140,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id}) — profile: {profile}")
+        logger.info(f"🔍 {name} ({account_id}) — profile: {profile}")
 
         # Reuse session from --profile if already authenticated
         session = account.get("_session") or create_session(profile)
@@ -163,7 +163,7 @@ def main():
         inventory["summary"]["total_instances_found"] += total
 
     # Summary
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("📊 SUMMARY")
     logger.info("=" * 60)
     for account_id, count in inventory["summary"]["instances_by_account"].items():

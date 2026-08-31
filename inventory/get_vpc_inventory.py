@@ -206,7 +206,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         # Reuse session from --profile if already authenticated
         session = account.get('_session') or create_session(profile)
@@ -233,7 +233,7 @@ def main():
         for k in totals:
             inventory["summary"][f"total_{k}"] += totals[k]
 
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("📊 SUMMARY")
     logger.info("=" * 60)
     logger.info(f"  Total VPCs: {inventory['summary']['total_vpcs']}")

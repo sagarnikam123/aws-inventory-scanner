@@ -160,7 +160,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         # Reuse session from --profile if already authenticated
         session = account.get("_session") or create_session(profile)
@@ -230,9 +230,9 @@ def main():
             "total_stale_users": total_stale,
         })
 
-        logger.info(f"\n  📄 Flushed: {output_dir / f'{SERVICE}-{timestamp}.json'}")
+        logger.info(f"  📄 Flushed: {output_dir / f'{SERVICE}-{timestamp}.json'}")
 
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("Done.")
 
 

@@ -125,7 +125,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         # Reuse session from --profile if already authenticated
         session = account.get("_session") or create_session(profile)
@@ -145,7 +145,7 @@ def main():
         inventory["accounts"][account_id] = {"name": name, "status": "ok"}
         inventory["summary"]["total_web_acls"] += total
 
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("📊 SUMMARY")
     logger.info("=" * 60)
     logger.info(f"  Total Web ACLs: {inventory['summary']['total_web_acls']} (💰 ~${inventory['summary']['total_web_acls'] * 5:.0f}/mo base)")

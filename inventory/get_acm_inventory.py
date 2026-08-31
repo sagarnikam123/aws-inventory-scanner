@@ -108,7 +108,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id}) — profile: {profile}")
+        logger.info(f"🔍 {name} ({account_id}) — profile: {profile}")
 
         session = account.get("_session") or create_session(profile)
         if not session:
@@ -124,7 +124,7 @@ def main():
 
         logger.info(f"  Total: {total} certificates")
 
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("📊 Done")
 
 

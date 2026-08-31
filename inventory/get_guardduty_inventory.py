@@ -106,7 +106,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         if not args.profile:
             # Reuse session from --profile if already authenticated
@@ -128,7 +128,7 @@ def main():
             "regions": results,
         })
 
-        logger.info(f"\n📊 {name}: {totals['detectors']} detectors, "
+        logger.info(f"📊 {name}: {totals['detectors']} detectors, "
                     f"Findings: {totals['findings_high']} high, {totals['findings_medium']} medium")
 
 

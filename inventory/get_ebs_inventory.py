@@ -160,7 +160,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id}) — profile: {profile}")
+        logger.info(f"🔍 {name} ({account_id}) — profile: {profile}")
 
         session = account.get("_session") or create_session(profile)
         if not session:
@@ -181,7 +181,7 @@ def main():
         total_waste = ebs_waste + eip_waste
         writer.set("estimated_monthly_waste_usd", round(total_waste, 2))
 
-        logger.info(f"\n  Summary: {totals['volumes']} volumes, "
+        logger.info(f"  Summary: {totals['volumes']} volumes, "
                    f"{totals['unattached_volumes']} unattached ({totals['unattached_volume_gb']} GB), "
                    f"{totals['snapshots']} snapshots, "
                    f"{totals['elastic_ips']} EIPs ({totals['unassociated_eips']} unassociated)")
@@ -189,7 +189,7 @@ def main():
             logger.info(f"  💰 Estimated waste: ${total_waste:,.2f}/mo "
                        f"(EBS: ${ebs_waste:,.2f} + EIP: ${eip_waste:,.2f})")
 
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("📊 Done")
 
 

@@ -4,9 +4,9 @@ CloudWatch Application Signals Inventory Scanner
 Scans SLOs (Service Level Objectives) and discovered services.
 
 Usage:
-    python get_application_signals_inventory.py                     # All accounts, all regions
-    python get_application_signals_inventory.py -a "TQ Hosted"      # Single account
-    python get_application_signals_inventory.py -p <profile> -r us-east-1
+    python get_cloudwatch_application_signals_inventory.py                     # All accounts, all regions
+    python get_cloudwatch_application_signals_inventory.py -a "TQ Hosted"      # Single account
+    python get_cloudwatch_application_signals_inventory.py -p <profile> -r us-east-1
 """
 
 import sys
@@ -23,7 +23,7 @@ from common import (
     scan_regions_parallel,
 )
 
-SERVICE = "application-signals"
+SERVICE = "cloudwatch-application-signals"
 
 
 def scan_region(session, region):
@@ -88,7 +88,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         session = account.get("_session") or create_session(profile)
         if not session:
@@ -103,7 +103,7 @@ def main():
         writer.set("total_slos", count)
         writer.set("status", "ok")
 
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("📊 Done")
 
 

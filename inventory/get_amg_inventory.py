@@ -84,7 +84,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         # Reuse session from --profile if already authenticated
         session = account.get("_session") or create_session(profile)
@@ -116,7 +116,7 @@ def main():
         summary = combined_data["summary"]
         summary["total_workspaces"] += acct_total
 
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("📊 SUMMARY")
     logger.info("=" * 60)
     logger.info(f"  Total AMG Workspaces: {combined_data['summary']['total_workspaces']}")

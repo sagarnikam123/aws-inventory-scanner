@@ -100,7 +100,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         if not args.profile:
             # Reuse session from --profile if already authenticated
@@ -120,7 +120,7 @@ def main():
             "aws_managed": totals["aws_managed"],
         })
 
-        logger.info(f"\n📊 {name}: {totals['keys']} keys "
+        logger.info(f"📊 {name}: {totals['keys']} keys "
                     f"({totals['customer_managed']} customer, {totals['aws_managed']} AWS-managed)")
 
 

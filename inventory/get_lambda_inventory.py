@@ -111,7 +111,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         if not args.profile:
             # Reuse session from --profile if already authenticated
@@ -126,7 +126,7 @@ def main():
         totals = scan_lambda(session, regions, writer)
         writer.update({"total_functions": totals["functions"]})
 
-        logger.info(f"\n📊 {name}: {totals['functions']} Lambda functions total")
+        logger.info(f"📊 {name}: {totals['functions']} Lambda functions total")
 
 
 if __name__ == "__main__":

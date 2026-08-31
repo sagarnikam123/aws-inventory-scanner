@@ -200,7 +200,7 @@ def _get_service_summary(rows: list, top_n: int = 15) -> dict:
 def _print_top_services(rows: list, label: str, top_n: int = 15):
     """Print top N services by unblended cost."""
     summary = _get_service_summary(rows, top_n)
-    logger.info(f"\n  📊 Top {top_n} services ({label}):")
+    logger.info(f"  📊 Top {top_n} services ({label}):")
     for entry in summary["top_15_services_mtd"]:
         logger.info(f"    ${entry['unblended_cost']:>12,.2f}  {entry['service']}")
     logger.info(f"    {'─' * 30}")
@@ -247,7 +247,7 @@ def main():
         account_id = account["account_id"]
         profile = account["profile"]
 
-        logger.info(f"\n🔍 {name} ({account_id}) — profile: {profile}")
+        logger.info(f"🔍 {name} ({account_id}) — profile: {profile}")
 
         session = account.get("_session") or create_session(profile)
         if not session:
@@ -295,7 +295,7 @@ def main():
     inventory["summary"]["all_service_names"] = grand_svc_summary["all_service_names"]
     inventory["summary"]["top_15_services_mtd"] = grand_svc_summary["top_15_services_mtd"]
 
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("📊 GRAND SUMMARY")
     logger.info("=" * 60)
     logger.info(f"  MTD (all accounts): ${inventory['summary']['grand_total_mtd']:,.2f}")

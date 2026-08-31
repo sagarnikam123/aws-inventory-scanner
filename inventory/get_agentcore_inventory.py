@@ -163,10 +163,10 @@ def main():
 
         # Skip disabled accounts
         if account.get('enabled') is False:
-            logger.info(f"\n⏭️  {name} ({account_id}) — skipped (no credentials)")
+            logger.info(f"⏭️  {name} ({account_id}) — skipped (no credentials)")
             continue
 
-        logger.info(f"\n🔍 {name} ({account_id}) — profile: {profile}")
+        logger.info(f"🔍 {name} ({account_id}) — profile: {profile}")
 
         # Reuse session from --profile if already authenticated
         session = account.get("_session") or create_session(profile)
@@ -214,7 +214,7 @@ def main():
         logger.info(f"  📄 {name}: {total_for_account} total AgentCore resources")
 
     # Final summary
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("📊 SUMMARY")
     logger.info("=" * 60)
     final = combined_data["summary"]

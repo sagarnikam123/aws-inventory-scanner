@@ -85,7 +85,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         # Reuse session from --profile if already authenticated
         session = account.get("_session") or create_session(profile)
@@ -107,7 +107,7 @@ def main():
         inventory["summary"]["total_hosted_zones"] += zone_count
         inventory["summary"]["total_records"] += records
 
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("📊 SUMMARY")
     logger.info("=" * 60)
     logger.info(f"  Total Hosted Zones: {inventory['summary']['total_hosted_zones']} (💰 ~${inventory['summary']['total_hosted_zones'] * 0.50:.2f}/mo)")

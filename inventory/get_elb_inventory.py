@@ -134,7 +134,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         # Reuse session from --profile if already authenticated
         session = account.get("_session") or create_session(profile)
@@ -159,7 +159,7 @@ def main():
         inventory["summary"]["total_target_groups"] += totals["target_groups"]
 
     total_lbs = inventory['summary']['total_alb_nlb'] + inventory['summary']['total_classic']
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("📊 SUMMARY")
     logger.info("=" * 60)
     logger.info(f"  Total ALB/NLB: {inventory['summary']['total_alb_nlb']}")

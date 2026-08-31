@@ -7,9 +7,9 @@ Idle/stopped canaries still cost (Lambda + S3 artifacts); failing canaries
 are monitoring blind spots. Both are worth flagging.
 
 Usage:
-    python get_synthetics_inventory.py                     # All accounts, all regions
-    python get_synthetics_inventory.py -a "TQ Hosted"      # Single account
-    python get_synthetics_inventory.py -p <profile> -r us-east-1
+    python get_cloudwatch_synthetics_inventory.py                     # All accounts, all regions
+    python get_cloudwatch_synthetics_inventory.py -a "TQ Hosted"      # Single account
+    python get_cloudwatch_synthetics_inventory.py -p <profile> -r us-east-1
 """
 
 import sys
@@ -26,7 +26,7 @@ from common import (
     scan_regions_parallel,
 )
 
-SERVICE = "synthetics"
+SERVICE = "cloudwatch-synthetics"
 
 
 def scan_region(session, region):
@@ -123,7 +123,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         session = account.get("_session") or create_session(profile)
         if not session:
@@ -138,7 +138,7 @@ def main():
         writer.set("total_canaries", canary_count)
         writer.set("status", "ok")
 
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("📊 Done")
 
 

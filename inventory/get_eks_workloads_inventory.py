@@ -394,10 +394,10 @@ def main():
         profile = account['profile']
 
         if account.get('enabled') is False:
-            logger.info(f"\n⏭️  {name} ({account_id}) — skipped (no credentials)")
+            logger.info(f"⏭️  {name} ({account_id}) — skipped (no credentials)")
             continue
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         # Reuse session from --profile if already authenticated
         session = account.get("_session") or create_session(profile)
@@ -478,7 +478,7 @@ def main():
         logger.info(f"  📄 Flushed: {account_id} ({acct_clusters} clusters, {acct_namespaces} namespaces)")
 
     # Final summary
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("📊 SUMMARY")
     logger.info("=" * 60)
     final = combined_data["summary"]

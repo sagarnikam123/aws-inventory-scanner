@@ -107,7 +107,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         session = account.get("_session") or create_session(profile)
         if not session:
@@ -120,7 +120,7 @@ def main():
         totals = scan_sns(session, regions, writer)
         writer.update({"total_topics": totals["topics"], "total_subscriptions": totals["subscriptions"]})
 
-        logger.info(f"\n📊 {name}: {totals['topics']} topics, {totals['subscriptions']} subscriptions total")
+        logger.info(f"📊 {name}: {totals['topics']} topics, {totals['subscriptions']} subscriptions total")
 
 
 if __name__ == "__main__":

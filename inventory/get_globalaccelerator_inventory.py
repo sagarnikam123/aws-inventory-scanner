@@ -100,7 +100,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         # Reuse session from --profile if already authenticated
         session = account.get("_session") or create_session(profile)
@@ -120,7 +120,7 @@ def main():
         inventory["accounts"][account_id] = {"name": name, "status": "ok"}
         inventory["summary"]["total_accelerators"] += accel_count
 
-    logger.info("\n" + "=" * 60)
+    logger.info("" + "=" * 60)
     logger.info("📊 SUMMARY")
     logger.info("=" * 60)
     logger.info(f"  Total Accelerators: {inventory['summary']['total_accelerators']} (💰 ~${inventory['summary']['total_accelerators'] * 18:.0f}/mo fixed + data transfer)")
