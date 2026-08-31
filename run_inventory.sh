@@ -17,12 +17,17 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INV_DIR="$HERE/inventory"
 LOG_DIR="$HERE/output/_run_logs"
 
-# --- load conf/.env (without clobbering already-exported env vars) ---
+# --- load conf/.env — inline env vars WIN over the file (only set if unset) ---
 if [[ -f "$HERE/conf/.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$HERE/conf/.env"
-  set +a
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"                    # strip comments
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"  # trim
+    [[ -z "$line" || "$line" != *=* ]] && continue
+    key="${line%%=*}"; val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"  # trim key
+    val="${val#"${val%%[![:space:]]*}"}"  # trim leading space of value
+    [[ -z "${!key:-}" ]] && export "$key=$val"   # only if not already set inline
+  done < "$HERE/conf/.env"
 fi
 
 : "${AWS_PROFILE:?Set AWS_PROFILE in conf/.env (see conf/.env.example)}"
@@ -65,29 +70,37 @@ echo "  Scripts:   ${#scripts[@]}"
 echo "  Logs:      $LOG_DIR"
 echo "============================================================"
 
+TOTAL="${#scripts[@]}"
+
 # --- worker: runs one script, logs output, reports pass/fail (never exits nonzero) ---
+# The index is assigned up front (dispatch order) and passed in — race-free,
+# unlike a shared counter under parallel -P.
 run_one() {
-  local script="$1" profile="$2" region="$3" invdir="$4" logdir="$5"
+  local indexed="$1" profile="$2" region="$3" invdir="$4" logdir="$5" total="$6"
+  local idx="${indexed%%:*}" script="${indexed#*:}"
   local name="${script%.py}"
   local log="$logdir/${name}.log"
   local ra=(); [[ -n "$region" ]] && ra=(-r "$region")
 
   if python3 "$invdir/$script" -p "$profile" "${ra[@]}" > "$log" 2>&1; then
     echo "ok" > "$log.status"
-    echo "✅ $script"
+    echo "$idx/$total - ✅ $script"
   else
     local code=$?
     echo "fail:$code" > "$log.status"
-    echo "⚠️  $script FAILED (exit $code) — see $log" >&2
+    echo "$idx/$total - ⚠️  $script FAILED (exit $code) — see $log" >&2
     tail -n 3 "$log" | sed 's/^/       /' >&2
   fi
 }
 export -f run_one
 
 # --- run PARALLEL at a time via xargs; failures don't stop the batch ---
-printf '%s\n' "${scripts[@]}" \
+# Prefix each script with its 1-based index ("3:get_ec2_inventory.py") so the
+# worker can print "3/73" without a shared counter.
+idx=0
+for s in "${scripts[@]}"; do idx=$((idx+1)); printf '%s:%s\n' "$idx" "$s"; done \
   | xargs -P "$PARALLEL" -I {} bash -c \
-      'run_one "$@"' _ {} "$AWS_PROFILE" "$AWS_REGION" "$INV_DIR" "$LOG_DIR"
+      'run_one "$@"' _ {} "$AWS_PROFILE" "$AWS_REGION" "$INV_DIR" "$LOG_DIR" "$TOTAL"
 
 echo "============================================================"
 # --- summary from logs ---
