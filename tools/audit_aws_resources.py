@@ -1688,6 +1688,80 @@ def check_reliability_security_lake(account_dir, days_threshold):
     return findings
 
 
+def check_reliability_synthetics(account_dir, days_threshold):
+    """Canaries that are broken (last run failed), stopped, or on an EOL runtime."""
+    findings = []
+    path = find_latest_inventory(account_dir, "synthetics")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, canaries in data.get("regions", {}).items():
+        if not isinstance(canaries, list):
+            continue
+        for c in canaries:
+            name = c.get("name", "unknown")
+            state = c.get("state", "")
+            last_run = (c.get("last_run_state") or "").upper()
+            runtime = c.get("runtime_version", "")
+
+            # Broken canary = monitoring blind spot (thinks it's covered, isn't)
+            if last_run in ("FAILED", "ERROR"):
+                findings.append(finding(
+                    "reliability", "Synthetics", region, name,
+                    f"Last run {last_run} — monitoring blind spot, alerts won't fire correctly",
+                    "high"
+                ))
+
+            # Stopped canary = configured monitoring that isn't running
+            if state == "STOPPED":
+                findings.append(finding(
+                    "reliability", "Synthetics", region, name,
+                    "Canary STOPPED — not monitoring; delete or restart",
+                    "medium"
+                ))
+
+            # EOL runtime. ponytail: prefix heuristic, not an exhaustive AWS
+            # list — syn-1.0 and puppeteer-3.x/selenium-1.x are long deprecated.
+            # Upgrade path: check AWS Synthetics runtime deprecation page and
+            # extend these prefixes when new versions age out.
+            if (runtime == "syn-1.0"
+                    or runtime.startswith("syn-nodejs-puppeteer-3.")
+                    or runtime.startswith("syn-python-selenium-1.")):
+                findings.append(finding(
+                    "reliability", "Synthetics", region, name,
+                    f"Deprecated runtime {runtime} — upgrade before AWS blocks it",
+                    "medium"
+                ))
+    return findings
+
+
+def check_drift_rum_no_sampling(account_dir, days_threshold):
+    """RUM app monitors that collect nothing (0% sample) — configured but useless."""
+    findings = []
+    path = find_latest_inventory(account_dir, "rum")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, monitors in data.get("regions", {}).items():
+        if not isinstance(monitors, list):
+            continue
+        for m in monitors:
+            rate = m.get("session_sample_rate")
+            if rate == 0:
+                findings.append(finding(
+                    "drift", "RUM", region, m.get("name", "unknown"),
+                    "Session sample rate 0% — monitor collects no data",
+                    "low"
+                ))
+    return findings
+
+
 ALL_CHECKS = [
     # Security
     check_security_ec2_public_ips,
@@ -1740,7 +1814,9 @@ ALL_CHECKS = [
     check_reliability_dynamodb_no_protection,
     check_reliability_backup_empty,
     check_reliability_workspaces_unhealthy,
+    check_reliability_synthetics,
     # Drift / Hygiene
+    check_drift_rum_no_sampling,
     check_drift_untagged_ec2,
     check_drift_eventbridge_disabled,
     check_drift_config_not_recording,
