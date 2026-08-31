@@ -17,6 +17,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INV_DIR="$HERE/inventory"
 LOG_DIR="$HERE/output/_run_logs"
 
+# The bash running THIS script (Homebrew 5.x). xargs must reuse it, not bare
+# `bash` (= /bin/bash 3.2 on macOS), which fails to re-parse the exported
+# run_one function (unicode/`(exit $code)` → "syntax error near `('").
+BASH="${BASH:-$(command -v bash)}"
+
 # --- load conf/.env — inline env vars WIN over the file (only set if unset) ---
 if [[ -f "$HERE/conf/.env" ]]; then
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -99,7 +104,7 @@ export -f run_one
 # worker can print "3/73" without a shared counter.
 idx=0
 for s in "${scripts[@]}"; do idx=$((idx+1)); printf '%s:%s\n' "$idx" "$s"; done \
-  | xargs -P "$PARALLEL" -I {} bash -c \
+  | xargs -P "$PARALLEL" -I {} "$BASH" -c \
       'run_one "$@"' _ {} "$AWS_PROFILE" "$AWS_REGION" "$INV_DIR" "$LOG_DIR" "$TOTAL"
 
 echo "============================================================"
