@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 CloudWatch Inventory Scanner
-Scans for log groups, alarms, and dashboards across all configured accounts/regions.
+Scans log groups, alarms, and dashboards across all configured accounts/regions.
 Data is flushed to disk incrementally per region — partial results are saved on crash.
 
 Usage:
@@ -21,15 +21,16 @@ from common import (
     get_output_dir, get_timestamp, add_common_args,
     create_session_with_identity, is_region_unsupported_error, log_region_skip,
     IncrementalWriter, make_output_filename,
-    run_with_timer,
+    run_with_timer, scan_regions_parallel,
 )
 
 SERVICE = "cloudwatch"
 
 
 def scan_region(session, region):
-    """Scan a single region for CloudWatch resources. Returns dict."""
-    region_data = {"log_groups": [], "alarms": [], "dashboards": [], "status": "ok"}
+    """Scan CloudWatch log groups, alarms, dashboards in one region.
+    Returns (region_data, counts)."""
+    region_data = {"log_groups": [], "alarms": []}
 
     try:
         logs_client = session.client('logs', region_name=region, config=BOTO_CONFIG)
@@ -64,33 +65,63 @@ def scan_region(session, region):
                     "actions": alarm.get('AlarmActions', []),
                 })
 
-        # Dashboards
-        try:
-            dash_resp = cw_client.list_dashboards()
-            for dash in dash_resp.get('DashboardEntries', []):
-                region_data["dashboards"].append({
-                    "name": dash['DashboardName'],
-                    "size": dash.get('Size', 0),
-                })
-        except Exception:
-            pass
-
     except Exception as e:
         if is_region_unsupported_error(e):
             log_region_skip(region, SERVICE, str(e))
-            region_data["status"] = "unsupported"
         else:
             logger.warning(f"  {region}: Error — {e}")
-            region_data["status"] = "error"
-            region_data["error"] = str(e)
+        return {}, {"log_groups": 0, "alarms": 0, "stored_bytes": 0}
 
-    # Compute region totals
-    region_data["total_log_groups"] = len(region_data["log_groups"])
-    region_data["total_alarms"] = len(region_data["alarms"])
-    region_data["total_dashboards"] = len(region_data["dashboards"])
-    region_data["stored_bytes"] = sum(lg.get('stored_bytes', 0) for lg in region_data["log_groups"])
+    stored = sum(lg["stored_bytes"] for lg in region_data["log_groups"])
+    counts = {
+        "log_groups": len(region_data["log_groups"]),
+        "alarms": len(region_data["alarms"]),
+        "stored_bytes": stored,
+    }
 
-    return region_data
+    # Empty region → return falsy so the helper skips the flush + log line
+    if not (region_data["log_groups"] or region_data["alarms"]):
+        return {}, counts
+
+    region_data["total_log_groups"] = counts["log_groups"]
+    region_data["total_alarms"] = counts["alarms"]
+    region_data["stored_bytes"] = stored
+    return region_data, counts
+
+
+def scan_dashboards(session, regions):
+    """List CloudWatch dashboards once. Dashboards are a global (per-account)
+    resource — list_dashboards returns the same set in every region, so we
+    query a single region to avoid counting them N times."""
+    # Use a region we're scanning if it's a standard one, else us-east-1 —
+    # avoids opt-in regions (regions[0] could be one) that reject the call.
+    region = "us-east-1" if (not regions or "us-east-1" in regions) else regions[0]
+    try:
+        cw = session.client('cloudwatch', region_name=region, config=BOTO_CONFIG)
+        resp = cw.list_dashboards()
+        return [{"name": d['DashboardName'], "size": d.get('Size', 0)}
+                for d in resp.get('DashboardEntries', [])]
+    except Exception as e:
+        logger.warning(f"  dashboards: {e}")
+        return []
+
+
+def scan_cloudwatch(session, regions, writer):
+    """Scan CloudWatch across all regions in parallel."""
+    totals = scan_regions_parallel(
+        session, regions, writer, scan_region,
+        log_fn=lambda region, c: logger.info(
+            f"  {region}: {c['log_groups']} log groups "
+            f"({c['stored_bytes'] / (1024**3):.2f} GB), {c['alarms']} alarms"
+        ),
+    )
+    # Dashboards are account-global — fetch once, not per region.
+    dashboards = scan_dashboards(session, regions)
+    if dashboards:
+        writer.set("dashboards", dashboards)
+        logger.info(f"  dashboards (global): {len(dashboards)}")
+    totals["dashboards"] = len(dashboards)
+    return totals
 
 
 def main():
@@ -111,94 +142,35 @@ def main():
     logger.info(f"Scanning {len(accounts)} account(s) across {len(regions)} region(s)")
     logger.info("=" * 60)
 
-    # Combined incremental writer
-    combined_data = {
-        "generated": timestamp,
-        "note": "CloudWatch log groups, alarms, and dashboards per account per region.",
-        "accounts": {},
-        "summary": {
-            "total_accounts_scanned": len(accounts),
-            "total_log_groups": 0,
-            "total_alarms": 0,
-            "total_dashboards": 0,
-            "total_stored_gb": 0,
-        }
-    }
-
     for account in accounts:
         name = account['name']
         account_id = account['account_id']
         profile = account['profile']
 
-        if account.get('enabled') is False:
-            logger.info(f"\n⏭️  {name} ({account_id}) — skipped (no credentials)")
-            continue
-
         logger.info(f"\n🔍 {name} ({account_id})")
 
-        # Reuse session from --profile if already authenticated
         session = account.get("_session") or create_session(profile)
         if not session:
-            combined_data["accounts"][account_id] = {
-                "name": name, "status": "auth_failed", "regions": {}
-            }
             continue
 
-        # Per-account incremental writer
-        account_output = get_output_dir(account_id, SERVICE)
-        account_writer = IncrementalWriter(account_output, make_output_filename(SERVICE, account_id, timestamp))
-        account_writer.update({
-            "name": name, "profile_used": profile, "status": "ok",
-            "total_log_groups": 0, "total_alarms": 0, "total_dashboards": 0, "total_stored_gb": 0,
-            "regions": {}
-        })
+        output_dir = get_output_dir(account_id, SERVICE)
+        writer = IncrementalWriter(output_dir, make_output_filename(SERVICE, account_id, timestamp))
+        writer.update({"name": name, "profile_used": profile, "status": "in_progress", "regions": {}})
 
-        acct_totals = {"log_groups": 0, "alarms": 0, "dashboards": 0, "stored_bytes": 0}
+        totals = scan_cloudwatch(session, regions, writer)
 
-        for region in regions:
-            region_data = scan_region(session, region)
+        writer.set("total_log_groups", totals.get("log_groups", 0))
+        writer.set("total_alarms", totals.get("alarms", 0))
+        writer.set("total_dashboards", totals.get("dashboards", 0))
+        writer.set("total_stored_gb", round(totals.get("stored_bytes", 0) / (1024**3), 2))
+        writer.set("status", "ok")
 
-            # Flush this region immediately
-            account_writer.set_nested("regions", region, value=region_data)
+        logger.info(f"\n📊 {name}: {totals.get('log_groups', 0)} log groups, "
+                    f"{totals.get('alarms', 0)} alarms, "
+                    f"{round(totals.get('stored_bytes', 0) / (1024**3), 1)} GB stored")
 
-            lg_count = region_data["total_log_groups"]
-            alarm_count = region_data["total_alarms"]
-            stored = region_data["stored_bytes"]
-
-            if lg_count > 0 or alarm_count > 0:
-                logger.info(f"  {region}: {lg_count} log groups ({stored / (1024**3):.2f} GB), {alarm_count} alarms")
-
-            acct_totals["log_groups"] += lg_count
-            acct_totals["alarms"] += alarm_count
-            acct_totals["dashboards"] += region_data["total_dashboards"]
-            acct_totals["stored_bytes"] += stored
-
-            # Update running totals in account file
-            account_writer.set("total_log_groups", acct_totals["log_groups"])
-            account_writer.set("total_alarms", acct_totals["alarms"])
-            account_writer.set("total_dashboards", acct_totals["dashboards"])
-            account_writer.set("total_stored_gb", round(acct_totals["stored_bytes"] / (1024**3), 2))
-
-        # Update combined with this account
-        combined_data["accounts"][account_id] = account_writer.get_data()
-
-        summary = combined_data["summary"]
-        summary["total_log_groups"] += acct_totals["log_groups"]
-        summary["total_alarms"] += acct_totals["alarms"]
-        summary["total_dashboards"] += acct_totals["dashboards"]
-        summary["total_stored_gb"] += round(acct_totals["stored_bytes"] / (1024**3), 2)
-
-        logger.info(f"  📄 Flushed: {account_id} ({acct_totals['log_groups']} log groups, {acct_totals['alarms']} alarms)")
-
-    # Final summary
     logger.info("\n" + "=" * 60)
-    logger.info("📊 SUMMARY")
-    logger.info("=" * 60)
-    final = combined_data["summary"]
-    logger.info(f"  Total Log Groups:  {final['total_log_groups']}")
-    logger.info(f"  Total Stored:      {final['total_stored_gb']:.2f} GB")
-    logger.info(f"  Total Alarms:      {final['total_alarms']}")
-    logger.info(f"  Total Dashboards:  {final['total_dashboards']}")
+    logger.info("📊 Done")
 
 
 if __name__ == "__main__":
