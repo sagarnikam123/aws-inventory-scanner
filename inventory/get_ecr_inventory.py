@@ -36,13 +36,16 @@ def scan_ecr_repositories(session, regions, writer):
             paginator = ecr_client.get_paginator('describe_repositories')
             for page in paginator.paginate():
                 for repo in page['repositories']:
-                    # Get image count
+                    # Get image count (paginated — describe_images caps at
+                    # 100 details/page; a single call undercounts big repos)
                     try:
-                        images_resp = ecr_client.describe_images(
+                        image_count = 0
+                        img_paginator = ecr_client.get_paginator('describe_images')
+                        for img_page in img_paginator.paginate(
                             repositoryName=repo['repositoryName'],
                             filter={'tagStatus': 'ANY'}
-                        )
-                        image_count = len(images_resp.get('imageDetails', []))
+                        ):
+                            image_count += len(img_page.get('imageDetails', []))
                     except Exception:
                         image_count = 0
 
