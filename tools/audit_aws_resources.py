@@ -29,6 +29,9 @@ from datetime import datetime, timezone, timedelta
 ROOT_DIR = Path(__file__).parent.parent
 OUTPUT_DIR = ROOT_DIR / "output"
 
+# Make `common` importable whether run as a script or imported as a library.
+sys.path.insert(0, str(ROOT_DIR))
+
 # Lambda runtimes that are deprecated/EOL
 DEPRECATED_RUNTIMES = {
     "python2.7", "python3.6", "python3.7", "python3.8",
@@ -38,8 +41,9 @@ DEPRECATED_RUNTIMES = {
     "java8", "go1.x",
 }
 
-# EKS versions considered outdated (< 1.28)
-EKS_MIN_SUPPORTED = "1.28"
+# EKS versions considered outdated. ponytail: hardcoded floor — AWS drops
+# ~3 versions/yr. Upgrade path: bump this as older versions leave standard support.
+EKS_MIN_SUPPORTED = "1.30"
 
 # AWS opt-in (disabled-by-default) regions. A regional security service being
 # "not enabled" here is expected, not a finding — the account never opted in.
@@ -129,6 +133,16 @@ def finding(category, service, region, resource, issue, severity, est_monthly_co
     if est_monthly_cost is not None:
         f["est_monthly_waste_usd"] = est_monthly_cost
     return f
+
+
+def _version_tuple(v):
+    """Parse a version like '1.28' / '1.9.3' into an int tuple for correct
+    numeric comparison ('1.9' < '1.28' is True as tuples, False as strings)."""
+    parts = []
+    for p in str(v).split("."):
+        num = "".join(c for c in p if c.isdigit())
+        parts.append(int(num) if num else 0)
+    return tuple(parts)
 
 
 # ============================================================
@@ -818,10 +832,11 @@ def check_cost_acm_unused(account_dir, days_threshold):
         for cert in certs:
             remaining = days_until(cert.get("not_after"))
             if remaining is not None and remaining < 30:
+                # Expiry is a reliability/security risk (TLS breaks), not cost.
                 findings.append(finding(
-                    "cost", "ACM", region,
+                    "reliability", "ACM", region,
                     cert.get("domain_name", "unknown"),
-                    f"Expires in {remaining} days!" if remaining > 0 else "EXPIRED",
+                    f"Cert expires in {remaining} days!" if remaining > 0 else "Cert EXPIRED",
                     "critical" if remaining <= 0 else "high"
                 ))
             if not cert.get("in_use", True):
@@ -902,7 +917,7 @@ def check_reliability_eks_version(account_dir, days_threshold):
             continue
         for cluster in clusters:
             version = cluster.get("version", cluster.get("kubernetes_version", ""))
-            if version and version < EKS_MIN_SUPPORTED:
+            if version and _version_tuple(version) < _version_tuple(EKS_MIN_SUPPORTED):
                 findings.append(finding(
                     "reliability", "EKS", region,
                     cluster.get("name", "unknown"),
@@ -1398,12 +1413,14 @@ def check_cost_s3_no_lifecycle(account_dir, days_threshold):
 
     buckets = data.get("buckets", [])
     for bucket in buckets:
-        lifecycle = bucket.get("lifecycle", {})
+        lifecycle = bucket.get("lifecycle") or {}
         size_gb = bucket.get("size_gb", 0)
         name = bucket.get("bucket_name", bucket.get("name", "unknown"))
         region = bucket.get("region", "global")
 
-        if not lifecycle or lifecycle.get("error"):
+        # Skip only when we couldn't read lifecycle (error) — a missing/empty
+        # lifecycle is itself a finding (Check 1), so don't skip on falsy.
+        if lifecycle.get("error"):
             continue
 
         retention_configured = lifecycle.get("retention_configured", False)
@@ -2005,7 +2022,6 @@ ALL_CHECKS = [
     check_security_amg_auth,
     check_security_documentdb,
     check_security_workspaces_unencrypted,
-    check_reliability_security_lake,  # emits security + reliability + cost + drift
     # Cost
     check_cost_ec2_stopped,
     check_cost_nat_gateways,
@@ -2045,6 +2061,7 @@ ALL_CHECKS = [
     check_reliability_ecs_failing,
     check_reliability_dynamodb_no_protection,
     check_reliability_backup_empty,
+    check_reliability_security_lake,  # also emits security + cost + drift findings
     check_reliability_workspaces_unhealthy,
     check_reliability_synthetics,
     check_reliability_amp_status,
@@ -2091,13 +2108,16 @@ def main():
             print("ERROR: --live-pricing requires --profile")
             sys.exit(1)
         global _SESSION
-        sys.path.insert(0, str(ROOT_DIR))
         from common import create_session
         _SESSION = create_session(args.profile)
         if _SESSION is None:
             print(f"ERROR: could not create session for profile {args.profile}")
             sys.exit(1)
         print(f"  💲 Live pricing enabled via profile {args.profile}")
+
+    if not OUTPUT_DIR.exists():
+        print(f"ERROR: {OUTPUT_DIR} does not exist. Run inventory scripts first.")
+        sys.exit(1)
 
     # Single-account by design. Resolve the one account dir to audit:
     # explicit -a, else infer when exactly one account exists in output/.
