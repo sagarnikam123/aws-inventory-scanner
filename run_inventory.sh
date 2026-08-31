@@ -15,8 +15,6 @@ set -uo pipefail   # NOT -e: one failing scanner must not abort the whole run
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INV_DIR="$HERE/inventory"
-LOG_DIR="$HERE/output/_run_logs"
-
 # The bash running THIS script (Homebrew 5.x). xargs must reuse it, not bare
 # `bash` (= /bin/bash 3.2 on macOS), which fails to re-parse the exported
 # run_one function (unicode/`(exit $code)` → "syntax error near `('").
@@ -35,11 +33,58 @@ if [[ -f "$HERE/conf/.env" ]]; then
   done < "$HERE/conf/.env"
 fi
 
-: "${AWS_PROFILE:?Set AWS_PROFILE in conf/.env (see conf/.env.example)}"
+# --- parse CLI arguments (CLI flags override .env and env vars) ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--profile)
+      AWS_PROFILE="$2"; shift 2 ;;
+    -a|--account)
+      ACCOUNT_ARG="$2"; shift 2 ;;
+    -r|--region)
+      AWS_REGION="$2"; shift 2 ;;
+    -j|--parallel)
+      PARALLEL="$2"; shift 2 ;;
+    --only)
+      ONLY="$2"; shift 2 ;;
+    --skip)
+      SKIP="$2"; shift 2 ;;
+    *)
+      shift ;;
+  esac
+done
+
+# If -a is given without -p, try to resolve profile from accounts.yaml
+if [[ -n "${ACCOUNT_ARG:-}" && -z "${AWS_PROFILE:-}" ]]; then
+  RESOLVED_PROF=$(python3 -c "
+from common import get_accounts
+accts = get_accounts('$ACCOUNT_ARG')
+if accts:
+    print(accts[0].get('profile', ''))
+" 2>/dev/null || true)
+  [[ -n "$RESOLVED_PROF" ]] && AWS_PROFILE="$RESOLVED_PROF"
+fi
+
+: "${AWS_PROFILE:?Set AWS_PROFILE via -p <profile> or in conf/.env (see conf/.env.example)}"
 PARALLEL="${PARALLEL:-2}"
 AWS_REGION="${AWS_REGION:-}"
 ONLY="${ONLY:-}"
 SKIP="${SKIP:-}"
+
+# --- resolve account ID to store logs per account in output/_run_logs/<account_id>/ ---
+ACCOUNT_ID=$(python3 -c "
+import boto3
+try:
+    s = boto3.Session(profile_name='$AWS_PROFILE')
+    print(s.client('sts').get_caller_identity()['Account'])
+except Exception:
+    print('')
+" 2>/dev/null || true)
+
+if [[ -n "$ACCOUNT_ID" ]]; then
+  LOG_DIR="$HERE/output/_run_logs/$ACCOUNT_ID"
+else
+  LOG_DIR="$HERE/output/_run_logs/${AWS_PROFILE}"
+fi
 
 # --- build the script list ---
 if [[ -n "$ONLY" ]]; then
@@ -64,7 +109,8 @@ if [[ -n "$SKIP" ]]; then
 fi
 
 mkdir -p "$LOG_DIR"
-rm -f "$LOG_DIR"/*.status   # clear prior run's outcomes
+STATUS_DIR=$(mktemp -d -t aws_inv_status.XXXXXX)
+trap 'rm -rf "$STATUS_DIR"' EXIT INT TERM
 
 echo "============================================================"
 echo "  AWS Inventory Runner"
@@ -76,23 +122,25 @@ echo "  Logs:      $LOG_DIR"
 echo "============================================================"
 
 TOTAL="${#scripts[@]}"
+START_TIME=$(date +%s)
 
 # --- worker: runs one script, logs output, reports pass/fail (never exits nonzero) ---
 # The index is assigned up front (dispatch order) and passed in — race-free,
 # unlike a shared counter under parallel -P.
 run_one() {
-  local indexed="$1" profile="$2" region="$3" invdir="$4" logdir="$5" total="$6"
+  local indexed="$1" profile="$2" region="$3" invdir="$4" logdir="$5" statusdir="$6" total="$7"
   local idx="${indexed%%:*}" script="${indexed#*:}"
   local name="${script%.py}"
   local log="$logdir/${name}.log"
+  local status_file="$statusdir/${name}.status"
   local ra=(); [[ -n "$region" ]] && ra=(-r "$region")
 
   if python3 "$invdir/$script" -p "$profile" "${ra[@]}" > "$log" 2>&1; then
-    echo "ok" > "$log.status"
+    echo "ok" > "$status_file"
     echo "$idx/$total - ✅ $script"
   else
     local code=$?
-    echo "fail:$code" > "$log.status"
+    echo "fail:$code" > "$status_file"
     echo "$idx/$total - ⚠️  $script FAILED (exit $code) — see $log" >&2
     tail -n 3 "$log" | sed 's/^/       /' >&2
   fi
@@ -105,22 +153,34 @@ export -f run_one
 idx=0
 for s in "${scripts[@]}"; do idx=$((idx+1)); printf '%s:%s\n' "$idx" "$s"; done \
   | xargs -P "$PARALLEL" -I {} "$BASH" -c \
-      'run_one "$@"' _ {} "$AWS_PROFILE" "$AWS_REGION" "$INV_DIR" "$LOG_DIR" "$TOTAL"
+      'run_one "$@"' _ {} "$AWS_PROFILE" "$AWS_REGION" "$INV_DIR" "$LOG_DIR" "$STATUS_DIR" "$TOTAL"
+
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+
+if [[ $ELAPSED -lt 60 ]]; then
+  ELAPSED_STR="${ELAPSED}s"
+elif [[ $ELAPSED -lt 3600 ]]; then
+  ELAPSED_STR="$((ELAPSED / 60))m $((ELAPSED % 60))s"
+else
+  ELAPSED_STR="$((ELAPSED / 3600))h $(((ELAPSED % 3600) / 60))m $((ELAPSED % 60))s"
+fi
 
 echo "============================================================"
-# --- summary from logs ---
+# --- summary from runtime status ---
 pass=0; fail=0; failed_names=()
 for s in "${scripts[@]}"; do
-  status_file="$LOG_DIR/${s%.py}.log.status"
+  status_file="$STATUS_DIR/${s%.py}.status"
   if [[ -f "$status_file" && "$(cat "$status_file")" == "ok" ]]; then
     ((pass++))
   else
     ((fail++)); failed_names+=("$s")
   fi
 done
-echo "  Done: $pass ok, $fail with errors"
+echo "  Done:       $pass ok, $fail with errors"
 if [[ $fail -gt 0 ]]; then
   echo "  Failed scripts:"
   printf '    %s\n' "${failed_names[@]}"
 fi
+echo "  Total Time: $ELAPSED_STR"
 echo "============================================================"
