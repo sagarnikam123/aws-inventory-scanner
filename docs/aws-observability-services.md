@@ -61,7 +61,7 @@ signals built on them (**alerts**, **dashboards**, **events**).
 
 | Service | What it does | Inventory | Audit |
 |---|---|---|---|
-| **AWS Health** | Open/upcoming service events affecting the account (maintenance, retirements, degradations) | ✅ `health` | — |
+| **AWS Health** | Open/upcoming service events affecting the account (maintenance, retirements, degradations) | ✅ `health` | ✅ open/upcoming events, security notifications |
 
 `health` is an event feed, not a per-resource inventory — it captures the last 90 days
 plus upcoming events. Requires **Business/Enterprise Support**; on Basic/Developer it
@@ -92,11 +92,12 @@ Deliberately skipped — deprecated, or no control-plane API to inventory.
 ## Coverage summary
 
 - **Inventory:** 20 observability services have scanners (incl. `health`).
-- **Audit:** 18 have anomaly/cost checks in `tools/audit_aws_resources.py` —
+- **Audit:** 19 have anomaly/cost checks in `tools/audit_aws_resources.py` —
   CloudWatch, CloudWatch Logs, X-Ray, AMP, AMG, OpenSearch, CloudTrail, EventBridge,
   Config, GuardDuty, Inspector, Security Hub, Security Lake, SNS, Kinesis, Synthetics,
-  RUM, Internet Monitor.
-- **Inventory but no audit yet:** CloudWatch Alarms, Application Signals, AWS Health
-  (event feed — surfaced as-is, no anomaly rule).
+  RUM, Internet Monitor, AWS Health.
+- **Inventory but no audit (by design):** CloudWatch Alarms (already covered by the
+  INSUFFICIENT_DATA drift check) and Application Signals (scanner captures no SLO
+  attainment data — an SLO merely existing isn't an anomaly).
 - **Not covered by a scanner (by design):** Evidently (deprecated) and ADOT
   (agent, no control-plane API).
