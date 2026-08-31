@@ -35,7 +35,7 @@ signals built on them (**alerts**, **dashboards**, **events**).
 | Service | What it does | Inventory | Audit |
 |---|---|---|---|
 | **Amazon GuardDuty** | Threat detection from VPC/DNS/CloudTrail signals | ✅ `guardduty` | ✅ detector not enabled |
-| **AWS Security Hub** | Aggregated security findings + posture scoring | ✅ `security_hub` | — |
+| **AWS Security Hub** | Aggregated security findings + posture scoring | ✅ `security_hub` | ✅ not enabled, 0 standards |
 | **Amazon Inspector** | Continuous vulnerability scanning (EC2/ECR/Lambda) | ✅ `inspector` | ✅ not enabled |
 | **Amazon Security Lake** | Central OCSF security-data lake (logs/findings) | ✅ `security_lake` | ✅ weak key, no replication, no retention, dead subs |
 
@@ -83,10 +83,10 @@ Deliberately skipped — either deprecated or no per-resource control-plane API 
 ## Coverage summary
 
 - **Inventory:** 19 observability services have scanners.
-- **Audit:** 12 have anomaly/cost checks in `tools/audit_aws_resources.py` —
+- **Audit:** 13 have anomaly/cost checks in `tools/audit_aws_resources.py` —
   CloudWatch, OpenSearch, CloudTrail, EventBridge, Config, GuardDuty, Inspector,
-  Security Lake, SNS, Kinesis, Synthetics, RUM.
-- **Inventory but no audit yet:** CloudWatch Alarms, X-Ray, AMP, AMG, Security Hub,
+  Security Hub, Security Lake, SNS, Kinesis, Synthetics, RUM.
+- **Inventory but no audit yet:** CloudWatch Alarms, X-Ray, AMP, AMG,
   Internet Monitor, Application Signals.
 - **Gaps (no scanner):** Evidently (deprecated), ADOT (agent, no API), AWS Health
   (event API, not inventory) — none are per-resource inventory targets.
