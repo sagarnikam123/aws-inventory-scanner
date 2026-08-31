@@ -39,9 +39,11 @@ def scan_region(session, region):
         paginator = logs_client.get_paginator('describe_log_groups')
         for page in paginator.paginate():
             for lg in page['logGroups']:
+                stored_bytes = lg.get('storedBytes', 0)
                 region_data["log_groups"].append({
                     "name": lg['logGroupName'],
-                    "stored_bytes": lg.get('storedBytes', 0),
+                    "stored_bytes": stored_bytes,
+                    "stored_gb": round(stored_bytes / (1024**3), 2),
                     "retention_days": lg.get('retentionInDays', 'Never expire'),
                     "created_at": lg.get('creationTime', 0),
                 })
@@ -55,8 +57,11 @@ def scan_region(session, region):
                     "state": alarm['StateValue'],
                     "metric": alarm.get('MetricName', 'N/A'),
                     "namespace": alarm.get('Namespace', 'N/A'),
+                    "statistic": alarm.get('Statistic', ''),
+                    "period": alarm.get('Period', 0),
                     "comparison": alarm.get('ComparisonOperator', ''),
                     "threshold": alarm.get('Threshold', 0),
+                    "actions": alarm.get('AlarmActions', []),
                 })
 
         # Dashboards

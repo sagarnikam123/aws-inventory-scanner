@@ -15,8 +15,7 @@ signals built on them (**alerts**, **dashboards**, **events**).
 
 | Service | What it does | Inventory script |
 |---|---|---|
-| **Amazon CloudWatch** | Metrics, logs, dashboards, Logs Insights, Container/Lambda Insights | `get_cloudwatch_inventory.py` |
-| **CloudWatch Alarms** | Metric/composite/anomaly-detection alarms → SNS actions | `get_cloudwatch_alarms_inventory.py` |
+| **Amazon CloudWatch** | Log groups, alarms, dashboards (+ Logs Insights, Container/Lambda Insights) | `get_cloudwatch_inventory.py` |
 | **AWS X-Ray** | Distributed tracing, service maps, latency analysis | `get_xray_inventory.py` |
 | **Amazon Managed Service for Prometheus (AMP)** | Managed Prometheus for metrics ingestion/query (PromQL) | `get_amp_inventory.py` |
 | **Amazon Managed Grafana (AMG)** | Managed Grafana dashboards over AMP/CloudWatch/X-Ray | `get_amg_inventory.py` |
@@ -52,10 +51,10 @@ signals built on them (**alerts**, **dashboards**, **events**).
 
 | Service | What it does | Inventory script |
 |---|---|---|
-| **CloudWatch Synthetics (Canaries)** | Scripted uptime/endpoint monitoring | `get_synthetics_inventory.py` |
-| **CloudWatch RUM** | Real User Monitoring for web app front-ends | `get_rum_inventory.py` |
-| **CloudWatch Internet Monitor** | Internet-path performance/availability | `get_internet_monitor_inventory.py` |
-| **CloudWatch Application Signals** | APM (SLOs, service map) over ADOT/X-Ray | `get_application_signals_inventory.py` |
+| **CloudWatch Synthetics (Canaries)** | Scripted uptime/endpoint monitoring | `get_cloudwatch_synthetics_inventory.py` |
+| **CloudWatch RUM** | Real User Monitoring for web app front-ends | `get_cloudwatch_rum_inventory.py` |
+| **CloudWatch Internet Monitor** | Internet-path performance/availability | `get_cloudwatch_internet_monitor_inventory.py` |
+| **CloudWatch Application Signals** | APM (SLOs, service map) over ADOT/X-Ray | `get_cloudwatch_application_signals_inventory.py` |
 
 ## Account-event feed (not a resource inventory)
 
@@ -89,5 +88,5 @@ Deliberately skipped — deprecated, or no control-plane API to inventory.
 
 ## Coverage summary
 
-- **20** observability services have inventory scanners.
+- **19** observability services have inventory scanners.
 - **Not covered (by design):** Evidently (deprecated) and ADOT (agent, no control-plane API).
