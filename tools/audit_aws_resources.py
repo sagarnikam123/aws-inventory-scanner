@@ -25,7 +25,6 @@ import glob
 import argparse
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict
 
 ROOT_DIR = Path(__file__).parent.parent
 OUTPUT_DIR = ROOT_DIR / "output"
@@ -141,7 +140,6 @@ _SESSION = None  # boto3 session when live pricing enabled, else None
 
 # Fallback per-GB-month EBS rates (us-east-1 list prices)
 EBS_FALLBACK_RATE = {"gp3": 0.08, "gp2": 0.10, "io1": 0.125, "io2": 0.125, "st1": 0.045, "sc1": 0.015}
-HOURS_PER_MONTH = 730
 
 
 def ebs_rate(region, volume_type):
@@ -153,16 +151,6 @@ def ebs_rate(region, volume_type):
         if price is not None:
             return price
     return EBS_FALLBACK_RATE.get(vt, 0.08)
-
-
-def ec2_monthly(region, instance_type):
-    """Monthly on-demand price for an EC2 instance type — live only (None if unavailable)."""
-    if _SESSION is not None and instance_type:
-        from common import get_ec2_hourly_price
-        hourly = get_ec2_hourly_price(_SESSION, region, instance_type)
-        if hourly is not None:
-            return round(hourly * HOURS_PER_MONTH, 2)
-    return None
 
 
 # ============================================================
@@ -1799,7 +1787,7 @@ def check_security_amg_auth(account_dir, days_threshold):
 def check_reliability_internet_monitor(account_dir, days_threshold):
     """Internet Monitor monitoring 100% of traffic (cost) or in a bad state."""
     findings = []
-    path = find_latest_inventory(account_dir, "internet-monitor")
+    path = find_latest_inventory(account_dir, "cloudwatch-internet-monitor")
     if not path:
         return findings
     data = load_json(path)
@@ -1931,7 +1919,7 @@ def check_reliability_security_lake(account_dir, days_threshold):
 def check_reliability_synthetics(account_dir, days_threshold):
     """Canaries that are broken (last run failed), stopped, or on an EOL runtime."""
     findings = []
-    path = find_latest_inventory(account_dir, "synthetics")
+    path = find_latest_inventory(account_dir, "cloudwatch-synthetics")
     if not path:
         return findings
     data = load_json(path)
@@ -1981,7 +1969,7 @@ def check_reliability_synthetics(account_dir, days_threshold):
 def check_drift_rum_no_sampling(account_dir, days_threshold):
     """RUM app monitors that collect nothing (0% sample) — configured but useless."""
     findings = []
-    path = find_latest_inventory(account_dir, "rum")
+    path = find_latest_inventory(account_dir, "cloudwatch-rum")
     if not path:
         return findings
     data = load_json(path)
@@ -2087,7 +2075,7 @@ def main():
                         help='Output as JSON (for presentations/reports)')
     parser.add_argument('--severity', '-s', default=None,
                         choices=['critical', 'high', 'medium', 'low', 'info'],
-                        help='Show only this severity and above')
+                        help='Minimum severity to show (this level and everything more severe)')
     parser.add_argument('--category', '-c', default=None,
                         choices=['security', 'cost', 'reliability', 'drift'],
                         help='Filter by category')
@@ -2111,33 +2099,39 @@ def main():
             sys.exit(1)
         print(f"  💲 Live pricing enabled via profile {args.profile}")
 
-    # Find account directories
-    if args.account_id:
-        account_dirs = [OUTPUT_DIR / args.account_id]
-        if not account_dirs[0].exists():
-            print(f"ERROR: No output found for account {args.account_id}")
+    # Single-account by design. Resolve the one account dir to audit:
+    # explicit -a, else infer when exactly one account exists in output/.
+    account_id = args.account_id
+    if not account_id:
+        candidates = [d.name for d in OUTPUT_DIR.iterdir()
+                      if d.is_dir() and d.name not in ("combined", "audit")]
+        if len(candidates) == 1:
+            account_id = candidates[0]
+        elif len(candidates) > 1:
+            print("ERROR: multiple accounts in output/ — specify one with -a <account_id>:")
+            for c in sorted(candidates):
+                print(f"  {c}")
             sys.exit(1)
-    else:
-        account_dirs = [d for d in OUTPUT_DIR.iterdir() if d.is_dir() and d.name != "combined"]
+        else:
+            print("ERROR: No inventory output found. Run inventory scripts first.")
+            sys.exit(1)
 
-    if not account_dirs:
-        print("ERROR: No inventory output found. Run inventory scripts first.")
+    account_dir = OUTPUT_DIR / account_id
+    if not account_dir.exists():
+        print(f"ERROR: No output found for account {account_id}")
         sys.exit(1)
 
     severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
     min_severity = severity_order.get(args.severity, 4) if args.severity else 4
 
     all_findings = []
-
-    for account_dir in sorted(account_dirs):
-        account_id = account_dir.name
-        for check_fn in ALL_CHECKS:
-            findings = check_fn(account_dir, args.days)
-            for f in findings:
-                if severity_order.get(f.get("severity", "info"), 4) <= min_severity:
-                    if args.category and f.get("category") != args.category:
-                        continue
-                    all_findings.append(f)
+    for check_fn in ALL_CHECKS:
+        findings = check_fn(account_dir, args.days)
+        for f in findings:
+            if severity_order.get(f.get("severity", "info"), 4) <= min_severity:
+                if args.category and f.get("category") != args.category:
+                    continue
+                all_findings.append(f)
 
     # Calculate estimated savings
     total_est_savings = sum(f.get("est_monthly_waste_usd", 0) for f in all_findings)
@@ -2182,7 +2176,7 @@ def main():
         print("  AWS RESOURCE AUDIT REPORT")
         print("  Security • Cost • Reliability • Drift")
         print("=" * 90)
-        print(f"  Accounts scanned:      {len(account_dirs)}")
+        print(f"  Account:               {account_id}")
         print(f"  Staleness threshold:   {args.days} days")
         print(f"  Total findings:        {len(all_findings)}")
         if total_est_savings > 0:
