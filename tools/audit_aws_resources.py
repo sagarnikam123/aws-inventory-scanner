@@ -1685,6 +1685,149 @@ def check_cost_amplify_stale(account_dir, days_threshold):
     return findings
 
 
+def check_cost_cloudwatch_log_retention(account_dir, days_threshold):
+    """CloudWatch log groups with no retention (never expire) — silent, growing cost."""
+    findings = []
+    path = find_latest_inventory(account_dir, "cloudwatch")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if not isinstance(region_data, dict):
+            continue
+        for lg in region_data.get("log_groups", []):
+            retention = lg.get("retention_days")
+            # Scanner writes "Never expire" (str) when no retention is set.
+            never_expires = isinstance(retention, str) or retention in (None, 0)
+            if not never_expires:
+                continue
+            gb = lg.get("stored_bytes", 0) / (1024 ** 3)
+            if gb < 1:  # ponytail: sub-GB log groups aren't worth the noise
+                continue
+            # CloudWatch Logs storage ~$0.03/GB-mo; unbounded retention means
+            # this only grows. Flag the estimated monthly storage as waste.
+            monthly = round(gb * 0.03, 2)
+            findings.append(finding(
+                "cost", "CloudWatch Logs", region,
+                lg.get("name", "unknown"),
+                f"No retention policy ({gb:.0f} GB) — logs kept forever, storage only grows",
+                "medium" if gb > 50 else "low",
+                est_monthly_cost=monthly
+            ))
+    return findings
+
+
+def check_cost_xray_full_sampling(account_dir, days_threshold):
+    """X-Ray sampling rules at 100% fixed rate — traces everything, expensive."""
+    findings = []
+    path = find_latest_inventory(account_dir, "xray")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        rules = region_data.get("sampling_rules", []) if isinstance(region_data, dict) else region_data
+        if not isinstance(rules, list):
+            continue
+        for rule in rules:
+            if rule.get("fixed_rate", 0) >= 1.0:
+                findings.append(finding(
+                    "cost", "X-Ray", region,
+                    rule.get("rule_name", "unknown"),
+                    "Sampling fixed_rate 100% — every request traced, high X-Ray cost",
+                    "medium"
+                ))
+    return findings
+
+
+def check_reliability_amp_status(account_dir, days_threshold):
+    """AMP (Managed Prometheus) workspaces not in ACTIVE state."""
+    findings = []
+    path = find_latest_inventory(account_dir, "amp")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        workspaces = region_data.get("workspaces", []) if isinstance(region_data, dict) else region_data
+        if not isinstance(workspaces, list):
+            continue
+        for ws in workspaces:
+            status = (ws.get("status") or "").upper()
+            if status and status != "ACTIVE":
+                findings.append(finding(
+                    "reliability", "AMP", region,
+                    ws.get("alias", ws.get("workspace_id", "unknown")),
+                    f"Workspace status {status} — metrics ingestion may be broken",
+                    "high" if "FAIL" in status else "medium"
+                ))
+    return findings
+
+
+def check_security_amg_auth(account_dir, days_threshold):
+    """AMG (Managed Grafana) workspaces without authentication configured."""
+    findings = []
+    path = find_latest_inventory(account_dir, "amg")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        workspaces = region_data.get("workspaces", []) if isinstance(region_data, dict) else region_data
+        if not isinstance(workspaces, list):
+            continue
+        for ws in workspaces:
+            name = ws.get("name", ws.get("id", "unknown"))
+            if not ws.get("auth_providers"):
+                findings.append(finding(
+                    "security", "AMG", region, name,
+                    "No auth providers (SAML/IAM Identity Center) — access control gap",
+                    "high"
+                ))
+    return findings
+
+
+def check_reliability_internet_monitor(account_dir, days_threshold):
+    """Internet Monitor monitoring 100% of traffic (cost) or in a bad state."""
+    findings = []
+    path = find_latest_inventory(account_dir, "internet-monitor")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        monitors = region_data.get("monitors", []) if isinstance(region_data, dict) else region_data
+        if not isinstance(monitors, list):
+            continue
+        for m in monitors:
+            name = m.get("name", "unknown")
+            if m.get("traffic_percentage") == 100:
+                findings.append(finding(
+                    "cost", "Internet Monitor", region, name,
+                    "Monitoring 100% of traffic — sample a subset to cut cost",
+                    "low"
+                ))
+            status = (m.get("status") or "").upper()
+            if status and status not in ("ACTIVE", "OK"):
+                findings.append(finding(
+                    "reliability", "Internet Monitor", region, name,
+                    f"Monitor status {status} — not collecting",
+                    "medium"
+                ))
+    return findings
+
+
 def check_reliability_security_lake(account_dir, days_threshold):
     """Security Lake posture: weak encryption, no replication, no retention, dead subscribers."""
     findings = []
@@ -1823,6 +1966,7 @@ ALL_CHECKS = [
     check_security_guardduty,
     check_security_inspector,
     check_security_hub,
+    check_security_amg_auth,
     check_security_documentdb,
     check_security_workspaces_unencrypted,
     check_reliability_security_lake,  # emits security + reliability + cost + drift
@@ -1855,6 +1999,8 @@ ALL_CHECKS = [
     check_cost_transit_gateway,
     check_cost_workspaces_idle,
     check_cost_amplify_stale,
+    check_cost_cloudwatch_log_retention,
+    check_cost_xray_full_sampling,
     # Reliability
     check_reliability_rds,
     check_reliability_eks_version,
@@ -1865,6 +2011,8 @@ ALL_CHECKS = [
     check_reliability_backup_empty,
     check_reliability_workspaces_unhealthy,
     check_reliability_synthetics,
+    check_reliability_amp_status,
+    check_reliability_internet_monitor,
     # Drift / Hygiene
     check_drift_rum_no_sampling,
     check_drift_untagged_ec2,
