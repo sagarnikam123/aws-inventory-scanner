@@ -32,17 +32,17 @@ Runs all scanners N at a time. A failing scanner is warned to the console but
 **never stops the run** — the rest continue.
 
 ```bash
-cp .env.example .env      # edit AWS_PROFILE, PARALLEL, etc.
+cp conf/.env.example conf/.env    # edit AWS_PROFILE, PARALLEL, etc.
 ./run_inventory.sh
 ```
 
-Inline override (no .env needed):
+Inline override (no conf/.env needed):
 
 ```bash
 AWS_PROFILE=123456789012_AdministratorAccess PARALLEL=4 ./run_inventory.sh
 ```
 
-### `.env` settings
+### `conf/.env` settings
 
 | Var | Default | Meaning |
 |-----|---------|---------|

@@ -36,8 +36,22 @@ python inventory/get_ec2_inventory.py -p my_aws_profile
 python inventory/get_ec2_inventory.py -p my_aws_profile -r us-east-1
 ```
 
-> Each scanner runs independently — there is no run-all wrapper. Run the
-> scripts you need for the account you're scanning.
+### Run all scanners
+
+`run_inventory.sh` runs every scanner for one account, N at a time. A failing
+scanner is warned to the console but never stops the run.
+
+```bash
+cp conf/.env.example conf/.env     # set AWS_PROFILE, PARALLEL, etc.
+./run_inventory.sh
+
+# or override inline (no conf/.env needed)
+AWS_PROFILE=123456789012_AdministratorAccess PARALLEL=4 ./run_inventory.sh
+```
+
+Config lives in `conf/.env` (`AWS_PROFILE`, `AWS_REGION`, `PARALLEL`, `ONLY`, `SKIP`).
+Per-script logs go to `output/_run_logs/`. Full details and the shared-args
+reference: [docs/running-all-scanners.md](docs/running-all-scanners.md).
 
 ## Services Covered
 
@@ -176,9 +190,12 @@ aws-inventory-scanner/
 ├── README.md
 ├── LICENSE
 ├── .gitignore
+├── run_inventory.sh            ← Batch runner (all scanners, N parallel)
 ├── conf/
 │   ├── accounts.yaml           ← Your accounts (gitignored)
-│   └── accounts.yaml.example   ← Template
+│   ├── accounts.yaml.example   ← Template
+│   ├── .env                    ← Runner config (gitignored)
+│   └── .env.example            ← Runner config template
 ├── common/
 │   ├── __init__.py             ← Package init (re-exports)
 │   └── common.py               ← Shared utilities

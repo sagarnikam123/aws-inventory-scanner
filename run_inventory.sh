@@ -17,15 +17,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INV_DIR="$HERE/inventory"
 LOG_DIR="$HERE/output/_run_logs"
 
-# --- load .env (without clobbering already-exported env vars) ---
-if [[ -f "$HERE/.env" ]]; then
+# --- load conf/.env (without clobbering already-exported env vars) ---
+if [[ -f "$HERE/conf/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
-  source "$HERE/.env"
+  source "$HERE/conf/.env"
   set +a
 fi
 
-: "${AWS_PROFILE:?Set AWS_PROFILE in .env (see .env.example)}"
+: "${AWS_PROFILE:?Set AWS_PROFILE in conf/.env (see conf/.env.example)}"
 PARALLEL="${PARALLEL:-2}"
 AWS_REGION="${AWS_REGION:-}"
 ONLY="${ONLY:-}"
