@@ -42,6 +42,17 @@ DEPRECATED_RUNTIMES = {
 # EKS versions considered outdated (< 1.28)
 EKS_MIN_SUPPORTED = "1.28"
 
+# AWS opt-in (disabled-by-default) regions. A regional security service being
+# "not enabled" here is expected, not a finding — the account never opted in.
+# ponytail: static list; AWS adds ~1-2/yr. Upgrade path: append new opt-in
+# regions, or switch to account.describe_regions(AllRegions filter) if this drifts.
+OPT_IN_REGIONS = {
+    "af-south-1", "ap-east-1", "ap-east-2", "ap-south-2",
+    "ap-southeast-3", "ap-southeast-4", "ap-southeast-5", "ap-southeast-6", "ap-southeast-7",
+    "ca-west-1", "eu-central-2", "eu-south-1", "eu-south-2",
+    "il-central-1", "me-central-1", "me-south-1", "mx-central-1",
+}
+
 
 def find_latest_inventory(account_dir, service):
     """Find the most recent inventory JSON for a service."""
@@ -359,6 +370,8 @@ def check_security_guardduty(account_dir, days_threshold):
         return findings
 
     for region, region_data in data.get("regions", {}).items():
+        if region in OPT_IN_REGIONS:
+            continue
         detectors = region_data if isinstance(region_data, list) else region_data.get("detectors", [])
         if not detectors:
             findings.append(finding(
@@ -381,6 +394,8 @@ def check_security_inspector(account_dir, days_threshold):
         return findings
 
     for region, region_data in data.get("regions", {}).items():
+        if region in OPT_IN_REGIONS:
+            continue
         if not isinstance(region_data, dict):
             continue
         if not region_data.get("enabled", False):
@@ -389,6 +404,40 @@ def check_security_inspector(account_dir, days_threshold):
                 "N/A",
                 "Inspector not enabled — no vulnerability scanning",
                 "medium"
+            ))
+    return findings
+
+
+def check_security_hub(account_dir, days_threshold):
+    """Security Hub not enabled, or enabled with no standards subscribed."""
+    findings = []
+    path = find_latest_inventory(account_dir, "security-hub")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if region in OPT_IN_REGIONS:
+            continue
+        if not isinstance(region_data, dict):
+            continue
+        if not region_data.get("enabled", False):
+            findings.append(finding(
+                "security", "Security Hub", region,
+                "N/A",
+                "Security Hub not enabled — no aggregated findings / posture score",
+                "medium"
+            ))
+        elif not region_data.get("standards"):
+            # Enabled but no benchmark subscribed = paying for ingestion with
+            # no compliance checks running against it.
+            findings.append(finding(
+                "security", "Security Hub", region,
+                "N/A",
+                "Enabled but 0 standards subscribed — no compliance checks running",
+                "low"
             ))
     return findings
 
@@ -1773,6 +1822,7 @@ ALL_CHECKS = [
     check_security_iam,
     check_security_guardduty,
     check_security_inspector,
+    check_security_hub,
     check_security_documentdb,
     check_security_workspaces_unencrypted,
     check_reliability_security_lake,  # emits security + reliability + cost + drift
