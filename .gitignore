@@ -3,6 +3,7 @@ output/
 
 # Private config (contains real account IDs and profile names)
 conf/accounts.yaml
+.env
 
 # Analysis files (may contain private account/org data)
 analysis/
