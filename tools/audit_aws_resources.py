@@ -6,7 +6,7 @@ Reads inventory JSONs and produces a comprehensive findings report.
 Categories:
   🔒 SECURITY      — Exposed resources, missing encryption, stale credentials
   💰 COST          — Waste, idle resources, over-provisioning
-  ⚙️  RELIABILITY   — Single points of failure, missing backups, outdated versions
+  ⚙️ RELIABILITY   — Single points of failure, missing backups, outdated versions
   🧹 DRIFT/HYGIENE — Untagged resources, disabled rules, misconfiguration
 
 Usage:
@@ -66,6 +66,13 @@ def parse_timestamp(ts):
             ts = ts / 1000
         return datetime.fromtimestamp(ts, tz=timezone.utc)
     if isinstance(ts, str):
+        # fromisoformat handles both 'T' and space separators, microseconds,
+        # and colon tz offsets (+05:30) — covers most boto3 str timestamps.
+        try:
+            dt = datetime.fromisoformat(ts)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
         for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%d %H:%M:%S%z",
                     "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
             try:
@@ -1503,6 +1510,184 @@ def check_cost_transit_gateway(account_dir, days_threshold):
 # ALL CHECKS REGISTRY
 # ============================================================
 
+def check_cost_workspaces_idle(account_dir, days_threshold):
+    """WorkSpaces on ALWAYS_ON that look idle, plus long-stopped ones still billed."""
+    findings = []
+    path = find_latest_inventory(account_dir, "workspaces")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, workspaces in data.get("regions", {}).items():
+        if not isinstance(workspaces, list):
+            continue
+        for ws in workspaces:
+            ws_id = ws.get("workspace_id", "unknown")
+            user = ws.get("user_name", "?")
+            resource = f"{ws_id} ({user})"
+            mode = ws.get("running_mode", "")
+            last = ws.get("last_active", "")
+            idle_days = days_ago(last) if last else None
+
+            # ALWAYS_ON bills a flat monthly rate (~$21-64/mo by bundle) even
+            # when unused. Idle ALWAYS_ON is the classic WorkSpaces waste.
+            if mode == "ALWAYS_ON":
+                if idle_days is None or idle_days >= days_threshold:
+                    when = f"no login in {idle_days}d" if idle_days is not None else "never connected"
+                    findings.append(finding(
+                        "cost", "WorkSpaces", region, resource,
+                        f"ALWAYS_ON but {when} — switch to AUTO_STOP or terminate",
+                        "medium",
+                        est_monthly_cost=35  # ponytail: mid-bundle avg; varies $21-64 by type
+                    ))
+            # Any workspace with a real user that hasn't connected in a long
+            # time is a decommission candidate regardless of running mode.
+            elif idle_days is not None and idle_days >= days_threshold:
+                findings.append(finding(
+                    "cost", "WorkSpaces", region, resource,
+                    f"No login in {idle_days}d — decommission candidate",
+                    "low",
+                    est_monthly_cost=10  # ponytail: AUTO_STOP still bills storage + occasional use
+                ))
+    return findings
+
+
+def check_security_workspaces_unencrypted(account_dir, days_threshold):
+    """WorkSpaces user volumes without encryption."""
+    findings = []
+    path = find_latest_inventory(account_dir, "workspaces")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, workspaces in data.get("regions", {}).items():
+        if not isinstance(workspaces, list):
+            continue
+        for ws in workspaces:
+            if not ws.get("encrypted", False):
+                findings.append(finding(
+                    "security", "WorkSpaces", region,
+                    f"{ws.get('workspace_id', 'unknown')} ({ws.get('user_name', '?')})",
+                    "User volume NOT encrypted — data-at-rest exposure",
+                    "high"
+                ))
+    return findings
+
+
+def check_reliability_workspaces_unhealthy(account_dir, days_threshold):
+    """WorkSpaces stuck in an error/unhealthy state."""
+    findings = []
+    path = find_latest_inventory(account_dir, "workspaces")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    bad_states = {"ERROR", "UNHEALTHY", "IMPAIRED", "MAINTENANCE"}
+    for region, workspaces in data.get("regions", {}).items():
+        if not isinstance(workspaces, list):
+            continue
+        for ws in workspaces:
+            state = ws.get("state", "")
+            if state in bad_states:
+                findings.append(finding(
+                    "reliability", "WorkSpaces", region,
+                    f"{ws.get('workspace_id', 'unknown')} ({ws.get('user_name', '?')})",
+                    f"State {state} — user cannot work / needs rebuild",
+                    "high"
+                ))
+    return findings
+
+
+def check_cost_amplify_stale(account_dir, days_threshold):
+    """Amplify apps not updated in months, or apps with no branches."""
+    findings = []
+    path = find_latest_inventory(account_dir, "amplify")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, apps in data.get("regions", {}).items():
+        if not isinstance(apps, list):
+            continue
+        for app in apps:
+            name = app.get("name", app.get("app_id", "unknown"))
+            if app.get("branch_count", 0) == 0:
+                findings.append(finding(
+                    "cost", "Amplify", region, name,
+                    "App has 0 branches — orphaned, delete",
+                    "low"
+                ))
+                continue
+            age = days_ago(app.get("updated_at", ""))
+            if age is not None and age >= days_threshold:
+                findings.append(finding(
+                    "cost", "Amplify", region, name,
+                    f"Not updated in {age}d — possibly abandoned hosting",
+                    "low"
+                ))
+    return findings
+
+
+def check_reliability_security_lake(account_dir, days_threshold):
+    """Security Lake posture: weak encryption, no replication, no retention, dead subscribers."""
+    findings = []
+    path = find_latest_inventory(account_dir, "security-lake")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, rd in data.get("regions", {}).items():
+        if not isinstance(rd, dict):
+            continue
+
+        for dl in rd.get("data_lakes", []):
+            arn = dl.get("arn", "data-lake")
+
+            # S3-managed key instead of a customer KMS key — weaker control
+            if dl.get("kms_key_id") in ("S3_MANAGED_KEY", "", None):
+                findings.append(finding(
+                    "security", "Security Lake", region, arn,
+                    "Data lake uses S3-managed key, not a customer KMS CMK",
+                    "medium"
+                ))
+
+            # Single-region SIEM store with no replication = SPOF for security data
+            if not dl.get("replication_enabled", False):
+                findings.append(finding(
+                    "reliability", "Security Lake", region, arn,
+                    "Replication disabled — security data has no cross-region copy",
+                    "medium"
+                ))
+
+            # No lifecycle transitions/expiration → S3 grows forever (real cost)
+            if not dl.get("retention_settings") and not dl.get("expiration_days"):
+                findings.append(finding(
+                    "cost", "Security Lake", region, arn,
+                    "No retention/lifecycle — log storage grows unbounded",
+                    "medium"
+                ))
+
+        for sub in rd.get("subscribers", []):
+            if sub.get("status") not in ("ACTIVE", ""):
+                findings.append(finding(
+                    "drift", "Security Lake", region,
+                    sub.get("name", sub.get("subscriber_id", "unknown")),
+                    f"Subscriber status {sub.get('status')} — not consuming data",
+                    "low"
+                ))
+    return findings
+
+
 ALL_CHECKS = [
     # Security
     check_security_ec2_public_ips,
@@ -1515,6 +1700,8 @@ ALL_CHECKS = [
     check_security_guardduty,
     check_security_inspector,
     check_security_documentdb,
+    check_security_workspaces_unencrypted,
+    check_reliability_security_lake,  # emits security + reliability + cost + drift
     # Cost
     check_cost_ec2_stopped,
     check_cost_nat_gateways,
@@ -1542,6 +1729,8 @@ ALL_CHECKS = [
     check_cost_waf_empty,
     check_cost_elasticache,
     check_cost_transit_gateway,
+    check_cost_workspaces_idle,
+    check_cost_amplify_stale,
     # Reliability
     check_reliability_rds,
     check_reliability_eks_version,
@@ -1550,6 +1739,7 @@ ALL_CHECKS = [
     check_reliability_ecs_failing,
     check_reliability_dynamodb_no_protection,
     check_reliability_backup_empty,
+    check_reliability_workspaces_unhealthy,
     # Drift / Hygiene
     check_drift_untagged_ec2,
     check_drift_eventbridge_disabled,
