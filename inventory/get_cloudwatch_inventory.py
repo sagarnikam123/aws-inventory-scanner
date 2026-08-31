@@ -147,7 +147,7 @@ def main():
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"\n🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id})")
 
         session = account.get("_session") or create_session(profile)
         if not session:
@@ -165,11 +165,11 @@ def main():
         writer.set("total_stored_gb", round(totals.get("stored_bytes", 0) / (1024**3), 2))
         writer.set("status", "ok")
 
-        logger.info(f"\n📊 {name}: {totals.get('log_groups', 0)} log groups, "
+        logger.info(f"📊 {name}: {totals.get('log_groups', 0)} log groups, "
                     f"{totals.get('alarms', 0)} alarms, "
                     f"{round(totals.get('stored_bytes', 0) / (1024**3), 1)} GB stored")
 
-    logger.info("\n" + "=" * 60)
+    logger.info("=" * 60)
     logger.info("📊 Done")
 
 
