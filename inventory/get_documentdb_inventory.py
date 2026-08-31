@@ -56,6 +56,8 @@ def scan_documentdb(session, regions, writer):
                             "created_at": cluster.get('ClusterCreateTime', ''),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Error listing clusters — {e}")
 
             # Instances
@@ -74,6 +76,8 @@ def scan_documentdb(session, regions, writer):
                             "created_at": instance.get('InstanceCreateTime', ''),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Error listing instances — {e}")
 
             writer.set_nested("regions", region, value=region_data)

@@ -89,6 +89,8 @@ def scan_ebs(session, regions, writer):
                         snapshot_count += 1
                         snapshot_total_gb += snap.get('VolumeSize', 0)
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Snapshots error — {e}")
 
             region_data["snapshots_summary"] = {
@@ -115,6 +117,8 @@ def scan_ebs(session, regions, writer):
                     if not entry["associated"]:
                         totals["unassociated_eips"] += 1
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: EIP error — {e}")
 
             writer.set_nested("regions", region, value=region_data)

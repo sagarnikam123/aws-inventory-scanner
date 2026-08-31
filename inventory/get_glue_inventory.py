@@ -56,6 +56,8 @@ def scan_glue(session, regions, writer):
                             "created_at": job.get('CreatedOn', ''),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Jobs error — {e}")
 
             # Crawlers
@@ -73,6 +75,8 @@ def scan_glue(session, regions, writer):
                             "created_at": crawler.get('CreationTime', ''),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Crawlers error — {e}")
 
             # Databases (Data Catalog)
@@ -87,6 +91,8 @@ def scan_glue(session, regions, writer):
                             "created_at": db.get('CreateTime', ''),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Databases error — {e}")
 
             writer.set_nested("regions", region, value=region_data)

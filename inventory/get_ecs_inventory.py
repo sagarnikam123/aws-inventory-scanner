@@ -92,6 +92,8 @@ def scan_ecs(session, regions, writer):
                                 })
                                 total_services += 1
                     except Exception as e:
+                        if is_region_unsupported_error(e):
+                            raise  # opt-in region — outer handler skips it once
                         logger.warning(f"  {region}: Error listing services for {cluster_name} — {e}")
 
                     clusters_data.append(cluster_entry)

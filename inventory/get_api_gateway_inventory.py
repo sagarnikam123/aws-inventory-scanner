@@ -50,6 +50,8 @@ def scan_api_gateway(session, regions, writer):
                             "created_date": api.get('createdDate', ''),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — let the outer handler skip it once
                 logger.warning(f"  {region}: REST APIs error — {e}")
 
             # HTTP & WebSocket APIs (API Gateway v2)
@@ -66,6 +68,8 @@ def scan_api_gateway(session, regions, writer):
                         "created_date": api.get('CreatedDate', ''),
                     })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — let the outer handler skip it once
                 logger.warning(f"  {region}: HTTP APIs error — {e}")
 
             writer.set_nested("regions", region, value=region_data)

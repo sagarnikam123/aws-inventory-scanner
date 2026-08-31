@@ -158,6 +158,8 @@ def scan_bedrock(session, regions, writer):
             try:
                 region_data, counts = future.result()
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: worker error — {e}")
                 continue
 

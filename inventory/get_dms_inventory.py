@@ -55,6 +55,8 @@ def scan_dms(session, regions, writer):
                             "created_at": ri.get('InstanceCreateTime', ''),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Instances error — {e}")
 
             # Replication tasks
@@ -74,6 +76,8 @@ def scan_dms(session, regions, writer):
                             "created_at": task.get('ReplicationTaskCreationDate', ''),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Tasks error — {e}")
 
             writer.set_nested("regions", region, value=region_data)

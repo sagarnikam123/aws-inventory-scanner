@@ -62,9 +62,13 @@ def scan_eventbridge(session, regions, writer):
                                     "description": rule.get('Description', ''),
                                 })
                     except Exception as e:
+                        if is_region_unsupported_error(e):
+                            raise  # opt-in region — outer handler skips it once
                         logger.warning(f"  {region}: Error listing rules for bus {bus_name} — {e}")
 
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Error listing buses — {e}")
 
             writer.set_nested("regions", region, value=region_data)

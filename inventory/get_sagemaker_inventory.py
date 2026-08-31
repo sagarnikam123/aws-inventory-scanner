@@ -51,6 +51,8 @@ def scan_sagemaker(session, regions, writer):
                             "last_modified": ep.get('LastModifiedTime', ''),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Endpoints error — {e}")
 
             # Notebook instances
@@ -67,6 +69,8 @@ def scan_sagemaker(session, regions, writer):
                             "last_modified": nb.get('LastModifiedTime', ''),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Notebooks error — {e}")
 
             # Studio Domains

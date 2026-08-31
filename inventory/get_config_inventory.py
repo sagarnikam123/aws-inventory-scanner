@@ -61,6 +61,8 @@ def scan_config(session, regions, writer):
                         "last_status": status.get('lastStatus', 'N/A'),
                     })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Recorders error — {e}")
 
             # Config rules
@@ -77,6 +79,8 @@ def scan_config(session, regions, writer):
                             "scope_resource_types": rule.get('Scope', {}).get('ComplianceResourceTypes', []),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Rules error — {e}")
 
             writer.set_nested("regions", region, value=region_data)

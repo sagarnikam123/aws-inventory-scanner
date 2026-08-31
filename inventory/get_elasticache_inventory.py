@@ -69,6 +69,8 @@ def scan_elasticache(session, regions, writer):
                             "cluster_mode": rg.get('ClusterEnabled', False),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Error listing replication groups — {e}")
 
             writer.set_nested("regions", region, value=region_data)

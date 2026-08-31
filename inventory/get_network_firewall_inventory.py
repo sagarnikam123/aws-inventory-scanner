@@ -62,6 +62,8 @@ def scan_network_firewall(session, regions, writer):
                         pass
                     region_data["firewalls"].append(entry)
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Firewalls error — {e}")
 
             # Rule groups
@@ -73,6 +75,8 @@ def scan_network_firewall(session, regions, writer):
                         "arn": rg.get('Arn', 'N/A'),
                     })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Rule groups error — {e}")
 
             writer.set_nested("regions", region, value=region_data)

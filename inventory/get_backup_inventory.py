@@ -51,6 +51,8 @@ def scan_backup(session, regions, writer):
                             "created_at": vault.get('CreationDate', ''),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Vaults error — {e}")
 
             # Backup Plans
@@ -67,6 +69,8 @@ def scan_backup(session, regions, writer):
                             "created_at": plan.get('CreationDate', ''),
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Plans error — {e}")
 
             writer.set_nested("regions", region, value=region_data)

@@ -48,6 +48,8 @@ def scan_ses(session, regions, writer):
                         "verification_status": identity.get('VerificationStatus', 'N/A'),
                     })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Identities error — {e}")
 
             # Configuration sets
@@ -56,6 +58,8 @@ def scan_ses(session, regions, writer):
                 for cs_name in resp.get('ConfigurationSets', []):
                     region_data["configuration_sets"].append({"name": cs_name})
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Config sets error — {e}")
 
             writer.set_nested("regions", region, value=region_data)

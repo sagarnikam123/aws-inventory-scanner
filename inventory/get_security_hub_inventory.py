@@ -64,6 +64,8 @@ def scan_security_hub(session, regions, writer):
                     })
                 total_standards += len(region_data["standards"])
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Standards error — {e}")
 
             # Finding counts by severity

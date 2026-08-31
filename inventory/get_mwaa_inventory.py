@@ -57,6 +57,8 @@ def scan_mwaa(session, regions, writer):
                         "created_at": detail.get('CreatedAt', ''),
                     })
                 except Exception as e:
+                    if is_region_unsupported_error(e):
+                        raise  # opt-in region — outer handler skips it once
                     logger.warning(f"  {region}: Error describing {env_name} — {e}")
                     environments.append({"name": env_name, "status": "describe_failed"})
 

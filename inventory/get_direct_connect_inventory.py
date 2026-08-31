@@ -53,6 +53,8 @@ def scan_direct_connect(session, regions, writer):
                         "aws_device_v2": conn.get('awsDeviceV2', ''),
                     })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Connections error — {e}")
 
             # Virtual interfaces
@@ -70,6 +72,8 @@ def scan_direct_connect(session, regions, writer):
                         "bgp_peers": len(vif.get('bgpPeers', [])),
                     })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: VIFs error — {e}")
 
             writer.set_nested("regions", region, value=region_data)

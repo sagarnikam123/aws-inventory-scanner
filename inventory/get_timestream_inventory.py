@@ -56,6 +56,8 @@ def scan_timestream(session, regions, writer):
                                     "magnetic_writes_enabled": tbl.get('MagneticStoreWriteProperties', {}).get('EnableMagneticStoreWrites', False),
                                 })
                     except Exception as e:
+                        if is_region_unsupported_error(e):
+                            raise  # opt-in region — outer handler skips it once
                         logger.warning(f"  {region}: Error listing tables for {db_name} — {e}")
 
                     databases.append({

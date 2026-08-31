@@ -55,6 +55,8 @@ def scan_transit_gateways(session, regions, writer):
                             "tags": {t['Key']: t['Value'] for t in tgw.get('Tags', [])},
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: TGW error — {e}")
 
             # Attachments
@@ -72,6 +74,8 @@ def scan_transit_gateways(session, regions, writer):
                             "tags": {t['Key']: t['Value'] for t in att.get('Tags', [])},
                         })
             except Exception as e:
+                if is_region_unsupported_error(e):
+                    raise  # opt-in region — outer handler skips it once
                 logger.warning(f"  {region}: Attachments error — {e}")
 
             writer.set_nested("regions", region, value=region_data)

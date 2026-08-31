@@ -61,6 +61,8 @@ def scan_dynamodb(session, regions, writer):
                             "created_at": desc.get('CreationDateTime', ''),
                         })
                     except Exception as e:
+                        if is_region_unsupported_error(e):
+                            raise  # opt-in region — outer handler skips it once
                         logger.warning(f"  {region}: Error describing {table_name} — {e}")
 
             writer.set_nested("regions", region, value=tables)
