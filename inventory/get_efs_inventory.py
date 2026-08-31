@@ -20,55 +20,57 @@ from common import (
     get_output_dir, get_timestamp, add_common_args,
     create_session_with_identity, is_region_unsupported_error, log_region_skip,
     run_with_timer, make_output_filename, IncrementalWriter,
+    scan_regions_parallel,
 )
+
+SERVICE = "efs"
+
+
+def scan_region(session, region):
+    """Scan EFS file systems in one region. Returns (filesystems, counts)."""
+    filesystems = []
+    try:
+        efs = session.client('efs', region_name=region, config=BOTO_CONFIG)
+        resp = efs.describe_file_systems()
+
+        for fs in resp.get('FileSystems', []):
+            size_bytes = fs.get('SizeInBytes', {}).get('Value', 0)
+            size_gb = round(size_bytes / (1024**3), 2)
+
+            filesystems.append({
+                "file_system_id": fs['FileSystemId'],
+                "name": fs.get('Name', 'N/A'),
+                "lifecycle_state": fs['LifeCycleState'],
+                "performance_mode": fs.get('PerformanceMode', 'generalPurpose'),
+                "throughput_mode": fs.get('ThroughputMode', 'bursting'),
+                "provisioned_throughput_mibps": fs.get('ProvisionedThroughputInMibps', 0),
+                "size_gb": size_gb,
+                "mount_targets": fs.get('NumberOfMountTargets', 0),
+                "encrypted": fs.get('Encrypted', False),
+                "created_at": fs.get('CreationTime', ''),
+                "tags": fs.get('Tags', []),
+            })
+
+    except Exception as e:
+        if is_region_unsupported_error(e):
+            log_region_skip(region, SERVICE, str(e))
+        else:
+            logger.warning(f"  {region}: Error — {e}")
+        return [], {"filesystems": 0, "size_gb": 0}
+
+    total_gb = sum(f['size_gb'] for f in filesystems)
+    return filesystems, {"filesystems": len(filesystems), "size_gb": total_gb}
 
 
 def scan_efs(session, regions, writer):
-    """Scan EFS file systems across all specified regions."""
-    total_filesystems = 0
-    total_size_gb = 0
-
-    for region in regions:
-        try:
-            efs = session.client('efs', region_name=region, config=BOTO_CONFIG)
-            resp = efs.describe_file_systems()
-            filesystems = []
-
-            for fs in resp.get('FileSystems', []):
-                size_bytes = fs.get('SizeInBytes', {}).get('Value', 0)
-                size_gb = round(size_bytes / (1024**3), 2)
-
-                # Get mount targets
-                mt_count = fs.get('NumberOfMountTargets', 0)
-
-                fs_info = {
-                    "file_system_id": fs['FileSystemId'],
-                    "name": fs.get('Name', 'N/A'),
-                    "lifecycle_state": fs['LifeCycleState'],
-                    "performance_mode": fs.get('PerformanceMode', 'generalPurpose'),
-                    "throughput_mode": fs.get('ThroughputMode', 'bursting'),
-                    "provisioned_throughput_mibps": fs.get('ProvisionedThroughputInMibps', 0),
-                    "size_gb": size_gb,
-                    "mount_targets": mt_count,
-                    "encrypted": fs.get('Encrypted', False),
-                    "created_at": fs.get('CreationTime', ''),
-                    "tags": fs.get('Tags', []),
-                }
-                filesystems.append(fs_info)
-                total_size_gb += size_gb
-
-            writer.set_nested("regions", region, value=filesystems)
-            total_filesystems += len(filesystems)
-
-            if filesystems:
-                region_size = sum(f['size_gb'] for f in filesystems)
-                logger.info(f"  {region}: {len(filesystems)} file systems ({region_size:.1f} GB)")
-
-        except Exception as e:
-            logger.warning(f"  {region}: Error — {e}")
-            writer.set_nested("regions", region, value=[])
-
-    return total_filesystems, total_size_gb
+    """Scan EFS across all regions in parallel."""
+    totals = scan_regions_parallel(
+        session, regions, writer, scan_region,
+        log_fn=lambda region, c: logger.info(
+            f"  {region}: {c['filesystems']} file systems ({c['size_gb']:.1f} GB)"
+        ),
+    )
+    return totals.get("filesystems", 0), totals.get("size_gb", 0)
 
 
 def main():
@@ -89,12 +91,6 @@ def main():
     logger.info(f"Scanning {len(accounts)} account(s) across {len(regions)} region(s)")
     logger.info("=" * 60)
 
-    inventory = {
-        "generated": timestamp,
-        "accounts": {},
-        "summary": {"total_filesystems": 0, "total_size_gb": 0}
-    }
-
     for account in accounts:
         name = account['name']
         account_id = account['account_id']
@@ -102,14 +98,12 @@ def main():
 
         logger.info(f"\n🔍 {name} ({account_id})")
 
-        # Reuse session from --profile if already authenticated
         session = account.get("_session") or create_session(profile)
         if not session:
-            inventory["accounts"][account_id] = {"name": name, "status": "auth_failed", "regions": {}}
             continue
 
-        output_dir = get_output_dir(account_id, "efs")
-        writer = IncrementalWriter(output_dir, make_output_filename("efs", account_id, timestamp))
+        output_dir = get_output_dir(account_id, SERVICE)
+        writer = IncrementalWriter(output_dir, make_output_filename(SERVICE, account_id, timestamp))
         writer.update({"name": name, "profile_used": profile, "status": "in_progress", "regions": {}})
 
         fs_count, size_gb = scan_efs(session, regions, writer)
@@ -118,15 +112,8 @@ def main():
         writer.set("total_size_gb", round(size_gb, 2))
         writer.set("status", "ok")
 
-        inventory["accounts"][account_id] = {"name": name, "status": "ok"}
-        inventory["summary"]["total_filesystems"] += fs_count
-        inventory["summary"]["total_size_gb"] += size_gb
-
     logger.info("\n" + "=" * 60)
-    logger.info("📊 SUMMARY")
-    logger.info("=" * 60)
-    logger.info(f"  Total EFS File Systems: {inventory['summary']['total_filesystems']}")
-    logger.info(f"  Total Size: {inventory['summary']['total_size_gb']:.1f} GB (💰 ~${inventory['summary']['total_size_gb'] * 0.30:.0f}/mo at $0.30/GB)")
+    logger.info("📊 Done")
 
 
 if __name__ == "__main__":
