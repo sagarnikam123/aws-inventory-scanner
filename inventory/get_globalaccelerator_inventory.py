@@ -64,7 +64,10 @@ def scan_global_accelerator(session, writer):
             writer.set("accelerators", accelerators)
 
     except Exception as e:
-        logger.warning(f"  Error: {e}")
+        if is_region_unsupported_error(e):
+            log_region_skip("us-west-2", "globalaccelerator", str(e))
+        else:
+            logger.warning(f"  Error: {e}")
 
     return len(accelerators)
 

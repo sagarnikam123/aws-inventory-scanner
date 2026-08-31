@@ -58,7 +58,10 @@ def scan_waf(session, regions, writer):
                 logger.info(f"  {region}: {len(web_acls)} Web ACLs")
 
         except Exception as e:
-            logger.warning(f"  {region}: Error — {e}")
+            if is_region_unsupported_error(e):
+                log_region_skip(region, "waf", str(e))
+            else:
+                logger.warning(f"  {region}: Error — {e}")
             writer.set_nested("regions", region, value=[])
 
     # CloudFront (global) WAFs — must query from us-east-1
