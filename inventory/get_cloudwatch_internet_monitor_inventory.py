@@ -113,7 +113,9 @@ def main():
         writer.set("total_monitors", count)
         writer.set("status", "ok")
 
-    logger.info("" + "=" * 60)
+        logger.info(f"  Total: {count} internet monitors")
+
+    logger.info("=" * 60)
     logger.info("📊 Done")
 
 

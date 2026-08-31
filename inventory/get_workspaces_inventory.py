@@ -122,7 +122,9 @@ def main():
         writer.set("total_workspaces", ws_count)
         writer.set("status", "ok")
 
-    logger.info("" + "=" * 60)
+        logger.info(f"  Total: {ws_count} workspaces")
+
+    logger.info("=" * 60)
     logger.info("📊 Done")
 
 

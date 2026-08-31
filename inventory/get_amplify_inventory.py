@@ -131,7 +131,9 @@ def main():
         writer.set("total_branches", branch_count)
         writer.set("status", "ok")
 
-    logger.info("" + "=" * 60)
+        logger.info(f"  Total: {app_count} apps, {branch_count} branches")
+
+    logger.info("=" * 60)
     logger.info("📊 Done")
 
 

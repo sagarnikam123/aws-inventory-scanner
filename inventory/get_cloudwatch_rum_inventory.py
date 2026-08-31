@@ -118,7 +118,9 @@ def main():
         writer.set("total_app_monitors", count)
         writer.set("status", "ok")
 
-    logger.info("" + "=" * 60)
+        logger.info(f"  Total: {count} app monitors")
+
+    logger.info("=" * 60)
     logger.info("📊 Done")
 
 

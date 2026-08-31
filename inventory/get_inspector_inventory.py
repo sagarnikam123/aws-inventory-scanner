@@ -48,7 +48,7 @@ def scan_inspector(session, regions, writer):
                     region_data["ecr_scanning"] = resource_state.get('ecr', {}).get('status', 'DISABLED')
                     region_data["lambda_scanning"] = resource_state.get('lambda', {}).get('status', 'DISABLED')
             except Exception as e:
-                if 'AccessDeniedException' in str(e) or 'not enabled' in str(e).lower():
+                if is_region_unsupported_error(e) or 'AccessDeniedException' in str(e) or 'not enabled' in str(e).lower():
                     writer.set_nested("regions", region, value={"enabled": False})
                     continue
                 logger.warning(f"  {region}: Status error — {e}")

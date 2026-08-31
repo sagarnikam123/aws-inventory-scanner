@@ -103,7 +103,9 @@ def main():
         writer.set("total_slos", count)
         writer.set("status", "ok")
 
-    logger.info("" + "=" * 60)
+        logger.info(f"  Total: {count} SLOs")
+
+    logger.info("=" * 60)
     logger.info("📊 Done")
 
 

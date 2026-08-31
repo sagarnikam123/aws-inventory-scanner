@@ -17,10 +17,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from common import (
     logger, BOTO_CONFIG, get_accounts, get_regions, create_session,
     get_output_dir, get_timestamp, add_common_args,
-    create_session_with_identity, is_region_unsupported_error,
+    create_session_with_identity, is_region_unsupported_error, log_region_skip,
     IncrementalWriter, make_output_filename,
     run_with_timer, scan_regions_parallel,
 )
+
+SERVICE = "sns"
 
 
 def scan_region(session, region):
@@ -68,11 +70,15 @@ def scan_region(session, region):
 
     except Exception as e:
         if is_region_unsupported_error(e):
+            log_region_skip(region, SERVICE, str(e))
             return {}, counts
         logger.warning(f"  {region}: Error — {e}")
         return {}, counts
 
     counts["topics"] = len(region_data["topics"])
+    if not region_data["topics"]:
+        return {}, counts
+
     return region_data, counts
 
 
@@ -80,7 +86,7 @@ def scan_sns(session, regions, writer):
     """Scan SNS across all regions in parallel, writing incrementally per region."""
     return scan_regions_parallel(
         session, regions, writer, scan_region,
-        log_fn=lambda region, c: logger.info(f"  {region}: {c['topics']} topic(s)"),
+        log_fn=lambda region, c: logger.info(f"  {region}: {c['topics']} topic(s)") if c.get('topics', 0) > 0 else None,
     )
 
 
@@ -101,26 +107,32 @@ def main():
     timestamp = get_timestamp()
 
     logger.info(f"Scanning {len(accounts)} account(s) across {len(regions)} region(s)")
+    logger.info("=" * 60)
 
     for account in accounts:
         name = account['name']
         account_id = account['account_id']
         profile = account['profile']
 
-        logger.info(f"🔍 {name} ({account_id})")
+        logger.info(f"🔍 {name} ({account_id}) — profile: {profile}")
 
         session = account.get("_session") or create_session(profile)
         if not session:
             continue
 
-        output_dir = get_output_dir(account_id, "sns")
-        writer = IncrementalWriter(output_dir, make_output_filename("sns", account_id, timestamp))
-        writer.update({"name": name, "profile_used": profile, "status": "ok"})
+        output_dir = get_output_dir(account_id, SERVICE)
+        writer = IncrementalWriter(output_dir, make_output_filename(SERVICE, account_id, timestamp))
+        writer.update({"name": name, "profile_used": profile, "status": "in_progress", "regions": {}})
 
         totals = scan_sns(session, regions, writer)
-        writer.update({"total_topics": totals["topics"], "total_subscriptions": totals["subscriptions"]})
+        writer.set("total_topics", totals.get("topics", 0))
+        writer.set("total_subscriptions", totals.get("subscriptions", 0))
+        writer.set("status", "ok")
 
-        logger.info(f"📊 {name}: {totals['topics']} topics, {totals['subscriptions']} subscriptions total")
+        logger.info(f"  Total: {totals.get('topics', 0)} topics, {totals.get('subscriptions', 0)} subscriptions")
+
+    logger.info("=" * 60)
+    logger.info("📊 Done")
 
 
 if __name__ == "__main__":

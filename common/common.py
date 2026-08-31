@@ -33,6 +33,11 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+# Silence internal third-party logs (credential discovery, connection pooling)
+logging.getLogger('botocore').setLevel(logging.WARNING)
+logging.getLogger('boto3').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,28 +70,52 @@ def get_accounts(filter_account: Optional[str] = None) -> List[Dict[str, str]]:
     return accounts
 
 
+_ENABLED_REGIONS = None
+
+
+def get_enabled_regions() -> List[str]:
+    """Get list of active/enabled AWS regions for the current environment."""
+    global _ENABLED_REGIONS
+    if _ENABLED_REGIONS is not None:
+        return _ENABLED_REGIONS
+
+    try:
+        ec2 = boto3.client('ec2', region_name='us-east-1', config=BOTO_CONFIG)
+        response = ec2.describe_regions(AllRegions=False)
+        _ENABLED_REGIONS = [r['RegionName'] for r in response.get('Regions', [])]
+        if _ENABLED_REGIONS:
+            return _ENABLED_REGIONS
+    except Exception:
+        pass
+
+    # Fallback to accounts.yaml static list
+    try:
+        config = load_accounts()
+        _ENABLED_REGIONS = config.get("regions", ["us-east-1"])
+    except Exception:
+        _ENABLED_REGIONS = ["us-east-1"]
+    return _ENABLED_REGIONS
+
+
 def get_regions(service: str = None) -> List[str]:
     """Get regions to scan.
-    If service is provided, returns only regions where that service is available.
-    Otherwise returns all AWS regions dynamically from EC2 describe_regions."""
+    If service is provided, returns only enabled regions where that service is available.
+    Otherwise returns all enabled AWS regions."""
+    enabled = get_enabled_regions()
+
     if service:
         try:
             session = boto3.Session()
-            available = session.get_available_regions(service)
+            available = set(session.get_available_regions(service))
             if available:
-                return available
+                # Intersect enabled regions with service available regions
+                filtered = [r for r in enabled if r in available]
+                if filtered:
+                    return filtered
         except Exception:
             pass
 
-    # Fallback: get all regions dynamically
-    try:
-        ec2 = boto3.client('ec2', region_name='us-east-1')
-        response = ec2.describe_regions(AllRegions=False)
-        return [r['RegionName'] for r in response['Regions']]
-    except Exception:
-        # Final fallback: use accounts.yaml static list
-        config = load_accounts()
-        return config.get("regions", ["us-east-1"])
+    return enabled
 
 
 def _validate_profile_exists(profile: str) -> bool:
@@ -267,6 +296,10 @@ def is_region_unsupported_error(error) -> bool:
         "EndpointConnectionError",
         "Connect timeout on endpoint URL",
         "ConnectTimeoutError",
+        "Unrecognized engine name",
+        "UnknownOperationException",
+        "SubscriptionRequiredException",
+        "FeatureNotSupportedException",
     ]
     return any(indicator in error_str for indicator in unsupported_indicators)
 

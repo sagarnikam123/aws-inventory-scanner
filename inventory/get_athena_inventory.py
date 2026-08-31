@@ -36,9 +36,10 @@ def scan_athena(session, regions, writer):
             client = session.client('athena', region_name=region, config=BOTO_CONFIG)
             workgroups = []
 
-            paginator = client.get_paginator('list_work_groups')
-            for page in paginator.paginate():
-                for wg_summary in page.get('WorkGroups', []):
+            kwargs = {}
+            while True:
+                resp = client.list_work_groups(**kwargs)
+                for wg_summary in resp.get('WorkGroups', []):
                     wg_name = wg_summary['Name']
                     entry = {
                         "name": wg_name,
@@ -62,6 +63,10 @@ def scan_athena(session, regions, writer):
                         pass
 
                     workgroups.append(entry)
+                token = resp.get('NextToken')
+                if not token:
+                    break
+                kwargs['NextToken'] = token
 
             writer.set_nested("regions", region, value=workgroups)
             total_workgroups += len(workgroups)

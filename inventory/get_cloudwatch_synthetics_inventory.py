@@ -138,7 +138,9 @@ def main():
         writer.set("total_canaries", canary_count)
         writer.set("status", "ok")
 
-    logger.info("" + "=" * 60)
+        logger.info(f"  Total: {canary_count} canaries")
+
+    logger.info("=" * 60)
     logger.info("📊 Done")
 
 

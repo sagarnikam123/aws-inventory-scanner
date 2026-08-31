@@ -37,16 +37,18 @@ def scan_timestream(session, regions, writer):
             client = session.client('timestream-write', region_name=region, config=BOTO_CONFIG)
             databases = []
 
-            db_paginator = client.get_paginator('list_databases')
-            for page in db_paginator.paginate():
-                for db in page.get('Databases', []):
+            db_kwargs = {}
+            while True:
+                db_resp = client.list_databases(**db_kwargs)
+                for db in db_resp.get('Databases', []):
                     db_name = db['DatabaseName']
                     tables = []
 
                     try:
-                        tbl_paginator = client.get_paginator('list_tables')
-                        for tbl_page in tbl_paginator.paginate(DatabaseName=db_name):
-                            for tbl in tbl_page.get('Tables', []):
+                        tbl_kwargs = {'DatabaseName': db_name}
+                        while True:
+                            tbl_resp = client.list_tables(**tbl_kwargs)
+                            for tbl in tbl_resp.get('Tables', []):
                                 retention = tbl.get('RetentionProperties', {})
                                 tables.append({
                                     "table_name": tbl['TableName'],
@@ -55,6 +57,10 @@ def scan_timestream(session, regions, writer):
                                     "magnetic_retention_days": retention.get('MagneticStoreRetentionPeriodInDays', 0),
                                     "magnetic_writes_enabled": tbl.get('MagneticStoreWriteProperties', {}).get('EnableMagneticStoreWrites', False),
                                 })
+                            tbl_token = tbl_resp.get('NextToken')
+                            if not tbl_token:
+                                break
+                            tbl_kwargs['NextToken'] = tbl_token
                     except Exception as e:
                         if is_region_unsupported_error(e):
                             raise  # opt-in region — outer handler skips it once
@@ -69,6 +75,11 @@ def scan_timestream(session, regions, writer):
                         "tables": tables,
                     })
                     total_tables += len(tables)
+
+                db_token = db_resp.get('NextToken')
+                if not db_token:
+                    break
+                db_kwargs['NextToken'] = db_token
 
             writer.set_nested("regions", region, value=databases)
             total_dbs += len(databases)

@@ -51,7 +51,7 @@ def scan_region(session, region):
                     "expiration_days": (lifecycle.get('expiration', {}) or {}).get('days'),
                 })
         except Exception as e:
-            if is_region_unsupported_error(e):
+            if is_region_unsupported_error(e) or 'AccessDeniedException' in str(e):
                 log_region_skip(region, SERVICE, str(e))
                 return {}, {"data_lakes": 0, "subscribers": 0, "log_sources": 0}
             raise
@@ -164,7 +164,9 @@ def main():
         writer.set("total_log_sources", totals.get("log_sources", 0))
         writer.set("status", "ok")
 
-    logger.info("" + "=" * 60)
+        logger.info(f"  Total: {totals.get('data_lakes', 0)} data lakes, {totals.get('subscribers', 0)} subscribers, {totals.get('log_sources', 0)} log sources")
+
+    logger.info("=" * 60)
     logger.info("📊 Done")
 
 
