@@ -4,9 +4,10 @@ Scan AWS resources across multiple accounts and regions. Outputs JSON per-accoun
 
 ## Features
 
-- 60+ service inventory scripts covering compute, storage, networking, databases, security, analytics, and more
-- Multi-account scanning via `accounts.yaml`
+- 70+ service inventory scripts covering compute, storage, networking, databases, security, analytics, observability, and more
+- Multi-account scanning via `accounts.yaml`, or single-account via `--profile`
 - Crash-safe: data written to disk after each region/query (nothing lost on interruption)
+- Parallel region scanning (ThreadPoolExecutor) for fast multi-region collection
 - Standard CLI: `--account`, `--profile`, `--region` across all scripts
 - Cost Explorer integration: service-level spend breakdown (MTD, YTD, monthly, by region/usage type/purchase option)
 - Output filenames include account ID for easy identification
@@ -22,39 +23,39 @@ pip install boto3 pyyaml
 cp conf/accounts.yaml.example conf/accounts.yaml
 # Edit conf/accounts.yaml with your real account IDs and profiles
 
-# Scan all accounts, all services
-python run_all.py
-
-# Single service
+# Single service, all accounts in accounts.yaml
 python inventory/get_ec2_inventory.py
 
-# Single account
+# Single account (by name from accounts.yaml)
 python inventory/get_ec2_inventory.py -a "Production"
 
-# Direct profile (bypasses accounts.yaml)
+# Direct profile (bypasses accounts.yaml — scan one account)
 python inventory/get_ec2_inventory.py -p my_aws_profile
 
 # Single region
-python inventory/get_ec2_inventory.py -r us-east-1
+python inventory/get_ec2_inventory.py -p my_aws_profile -r us-east-1
 ```
+
+> Each scanner runs independently — there is no run-all wrapper. Run the
+> scripts you need for the account you're scanning.
 
 ## Services Covered
 
 | Category | Scripts |
 |----------|---------|
-| **Compute** | EC2, ECS, EKS, Lambda, EMR, App Runner, Lightsail |
+| **Compute** | EC2, EBS, ECS, EKS, Lambda, EMR, App Runner, WorkSpaces |
 | **Storage** | S3, EFS, FSx, Glacier, Backup |
 | **Networking** | VPC, ELB, NAT Gateway, Transit Gateway, VPC Endpoints, Direct Connect, Global Accelerator, Route 53, CloudFront |
 | **Database** | RDS, DynamoDB, ElastiCache, DocumentDB, Redshift, Timestream |
-| **Security** | IAM, KMS, Secrets Manager, WAF, GuardDuty, Security Hub, Inspector, ACM |
-| **Analytics** | Athena, Glue, Kinesis, MSK, QuickSight, SageMaker |
-| **Application** | API Gateway, SQS, SNS, SES, Step Functions, EventBridge |
-| **AI/ML** | Bedrock (models, agents, knowledge bases, guardrails) |
-| **Management** | CloudWatch, CloudTrail, AWS Config, SSM, CodeBuild |
+| **Security** | IAM, KMS, Secrets Manager, WAF, GuardDuty, Security Hub, Inspector, ACM, Security Lake |
+| **Analytics** | Athena, Glue, Kinesis (+ Firehose), MSK, QuickSight, SageMaker |
+| **Application** | API Gateway, SQS, SNS, SES, Step Functions, EventBridge, Amplify |
+| **AI/ML** | Bedrock (models, agents, KBs, guardrails), Bedrock AgentCore |
+| **Management** | CloudWatch, CloudTrail, AWS Config, SSM, CodeBuild, AWS Health |
 | **Migration** | DMS |
 | **Firewall** | Network Firewall |
 | **Containers** | ECR, ECS, EKS + K8s workloads |
-| **Observability** | AMG (Managed Grafana), CloudWatch Alarms |
+| **Observability** | CloudWatch (logs/alarms/dashboards), X-Ray, AMP (Managed Prometheus), AMG (Managed Grafana), OpenSearch, Synthetics, RUM, Internet Monitor, Application Signals — see [docs/aws-observability-services.md](docs/aws-observability-services.md) |
 | **Cost** | Cost Explorer (MTD/YTD/monthly by service, region, usage type, purchase option) |
 | **Orchestration** | MWAA (Managed Airflow) |
 
@@ -133,7 +134,7 @@ Offline scripts that read inventory output — no AWS API calls needed.
 
 | Script | Purpose |
 |--------|---------|
-| `audit_aws_resources.py` | Full resource audit: security, cost, reliability, drift (48 checks) |
+| `audit_aws_resources.py` | Full resource audit: security, cost, reliability, drift (60+ checks) |
 | `check_eks_vpc_connectivity.py` | Maps EKS cluster ↔ VPC connectivity (peering, TGW) |
 | `get_eks_unique_deployments.py` | Extracts unique deployment names from K8s workloads inventory |
 | `get_eks_unique_namespaces.py` | Extracts unique namespace names with exclude filters |
@@ -149,8 +150,11 @@ python tools/audit_aws_resources.py -a 111111111111
 python tools/audit_aws_resources.py -a 111111111111 --category security
 python tools/audit_aws_resources.py -a 111111111111 --category cost
 
-# Custom staleness threshold (default: 180 days)
-python tools/audit_aws_resources.py -a 111111111111 --days 90
+# Custom staleness threshold (default: 90 days)
+python tools/audit_aws_resources.py -a 111111111111 --days 30
+
+# Use live AWS Pricing API for accurate per-region cost estimates
+python tools/audit_aws_resources.py -a 111111111111 --live-pricing -p my_aws_profile
 
 # Show only critical/high
 python tools/audit_aws_resources.py -a 111111111111 --severity high
@@ -189,6 +193,7 @@ aws-inventory-scanner/
 │   ├── get_eks_unique_namespaces.py
 │   └── get_eks_workloads_xls.py
 ├── docs/
+│   ├── aws-observability-services.md   ← Observability service → scanner map
 │   └── eks-kubectl-guide.md
 └── output/                      ← JSON output (gitignored)
 ```
@@ -197,10 +202,11 @@ aws-inventory-scanner/
 
 Follow the pattern in any existing script:
 
-1. Import from `common`: `IncrementalWriter`, `make_output_filename`, `add_common_args`, etc.
-2. Use `IncrementalWriter` — flush after each region
-3. Use `make_output_filename(service, account_id, timestamp)` for consistent naming
-4. Handle `is_region_unsupported_error()` for graceful region skips
+1. Import from `common`: `IncrementalWriter`, `make_output_filename`, `add_common_args`, `scan_regions_parallel`, etc.
+2. Write a `scan_region(session, region)` returning `(region_data, counts)`
+3. Drive it with `scan_regions_parallel(...)` — parallel regions + per-region incremental flush, for free
+4. Use `make_output_filename(service, account_id, timestamp)` for consistent naming
+5. Handle `is_region_unsupported_error()` for graceful opt-in region skips
 
 ## Requirements
 
