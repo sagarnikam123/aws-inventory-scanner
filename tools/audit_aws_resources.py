@@ -20,6 +20,7 @@ Usage:
 """
 
 import sys
+import re
 import json
 import glob
 import argparse
@@ -34,11 +35,11 @@ sys.path.insert(0, str(ROOT_DIR))
 
 # Lambda runtimes that are deprecated/EOL
 DEPRECATED_RUNTIMES = {
-    "python2.7", "python3.6", "python3.7", "python3.8",
-    "nodejs10.x", "nodejs12.x", "nodejs14.x", "nodejs16.x",
-    "dotnetcore2.1", "dotnetcore3.1", "dotnet5.0",
-    "ruby2.5", "ruby2.7",
-    "java8", "go1.x",
+    "python2.7", "python3.6", "python3.7", "python3.8", "python3.9",
+    "nodejs10.x", "nodejs12.x", "nodejs14.x", "nodejs16.x", "nodejs18.x",
+    "dotnetcore2.1", "dotnetcore3.1", "dotnet5.0", "dotnet6",
+    "ruby2.5", "ruby2.7", "ruby3.1",
+    "java8", "java8.al2", "go1.x",
 }
 
 # EKS versions considered outdated. ponytail: hardcoded floor — AWS drops
@@ -58,10 +59,21 @@ OPT_IN_REGIONS = {
 
 
 def find_latest_inventory(account_dir, service):
-    """Find the most recent inventory JSON for a service."""
-    pattern = str(account_dir / service / f"{service}-inventory-*.json")
-    files = sorted(glob.glob(pattern), key=lambda f: Path(f).stat().st_mtime, reverse=True)
-    return files[0] if files else None
+    """Find the most recent inventory JSON for a service, resilient to directory naming."""
+    patterns = [
+        account_dir / service / f"{service}-inventory-*.json",
+        account_dir / f"{service}s" / f"{service}-inventory-*.json",
+        account_dir / service.rstrip('s') / f"{service.rstrip('s')}-inventory-*.json",
+        account_dir / f"{service}s" / f"{service.rstrip('s')}-inventory-*.json",
+        account_dir / service / f"{service}-*.json",
+        account_dir / service / "*.json",
+        account_dir / f"{service}s" / "*.json",
+    ]
+    for p in patterns:
+        files = sorted(glob.glob(str(p)), key=lambda f: Path(f).stat().st_mtime, reverse=True)
+        if files:
+            return files[0]
+    return None
 
 
 def load_json(path):
@@ -1507,7 +1519,7 @@ def check_cost_waf_empty(account_dir, days_threshold):
 
 
 def check_cost_elasticache(account_dir, days_threshold):
-    """ElastiCache clusters — flag for utilization review."""
+    """ElastiCache clusters — flag for utilization review, grouped by replication group."""
     findings = []
     path = find_latest_inventory(account_dir, "elasticache")
     if not path:
@@ -1519,7 +1531,44 @@ def check_cost_elasticache(account_dir, days_threshold):
     for region, region_data in data.get("regions", {}).items():
         if not isinstance(region_data, dict):
             continue
-        for cluster in region_data.get("clusters", []):
+
+        clusters = region_data.get("clusters", [])
+        rep_groups = region_data.get("replication_groups", [])
+
+        # Map clusters by cluster_id
+        cluster_map = {c.get("cluster_id"): c for c in clusters if c.get("cluster_id")}
+        handled_cluster_ids = set()
+
+        # Group by replication group if present
+        for rg in rep_groups:
+            rg_id = rg.get("replication_group_id")
+            member_ids = rg.get("member_clusters", [])
+            if not member_ids:
+                continue
+
+            # Pick sample cluster for node type and created_at
+            sample = cluster_map.get(member_ids[0]) if member_ids else None
+            node_type = sample.get("node_type", "?") if sample else "?"
+            created_at = sample.get("created_at") if sample else None
+            num_nodes = len(member_ids)
+
+            for mid in member_ids:
+                handled_cluster_ids.add(mid)
+
+            if is_stale(created_at, days_threshold):
+                findings.append(finding(
+                    "cost", "ElastiCache", region,
+                    f"{rg_id} ({num_nodes} nodes)",
+                    f"{num_nodes}x {node_type} — old cluster group, verify still needed",
+                    "info",
+                    est_monthly_cost=num_nodes * 25
+                ))
+
+        # Check standalone clusters not part of a replication group
+        for cluster in clusters:
+            cid = cluster.get("cluster_id")
+            if cid in handled_cluster_ids:
+                continue
             node_type = cluster.get("node_type", "?")
             num_nodes = cluster.get("num_nodes", 1)
             if is_stale(cluster.get("created_at"), days_threshold):
@@ -1528,8 +1577,9 @@ def check_cost_elasticache(account_dir, days_threshold):
                     cluster.get("cluster_id", "unknown"),
                     f"{num_nodes}x {node_type} — old cluster, verify still needed",
                     "info",
-                    est_monthly_cost=num_nodes * 25  # ponytail: cache.t3.micro ~$12, t3.medium ~$50
+                    est_monthly_cost=num_nodes * 25
                 ))
+
     return findings
 
 
@@ -2007,6 +2057,85 @@ def check_drift_rum_no_sampling(account_dir, days_threshold):
     return findings
 
 
+def check_security_s3(account_dir, days_threshold):
+    """S3 buckets — check for unencrypted storage, replication gaps, and multipart upload waste."""
+    findings = []
+    path = find_latest_inventory(account_dir, "s3")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for b in data.get("buckets", []):
+        name = b.get("bucket_name", "unknown")
+        region = b.get("region", "global")
+        lifecycle = b.get("lifecycle", {}) or {}
+
+        # 1. Incomplete multipart uploads not aborted (accumulates storage cost silently)
+        abort_days = lifecycle.get("abort_incomplete_multipart_days")
+        if abort_days is None:
+            findings.append(finding(
+                "cost", "S3", region, name,
+                "Incomplete multipart uploads not aborted — unfinished uploads bill indefinitely",
+                "low",
+                est_monthly_cost=5
+            ))
+
+        # 2. Critical/production bucket replication checks
+        tags = b.get("tags", {}) or {}
+        env = str(tags.get("Environment", "")).lower()
+        if "prod" in env or "production" in env:
+            repl = b.get("replication", {}) or {}
+            if not repl.get("enabled", False):
+                findings.append(finding(
+                    "reliability", "S3", region, name,
+                    "Production bucket has no cross-region replication configured",
+                    "info"
+                ))
+
+    return findings
+
+
+def check_security_cloudfront(account_dir, days_threshold):
+    """CloudFront distributions — check for missing WAF and insecure TLS protocols."""
+    findings = []
+    path = find_latest_inventory(account_dir, "cloudfront")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    distributions = data.get("distributions", []) if isinstance(data.get("distributions"), list) else []
+    for d in distributions:
+        dist_id = d.get("id", "unknown")
+        domain = d.get("domain_name", "unknown")
+        enabled = d.get("enabled", True)
+        if not enabled:
+            continue
+
+        # Check WAF association
+        web_acl = d.get("web_acl_id", "")
+        if not web_acl:
+            findings.append(finding(
+                "security", "CloudFront", "global", f"{dist_id} ({domain})",
+                "No WAF WebACL associated — distribution exposed to layer 7 attacks",
+                "medium"
+            ))
+
+        # Check TLS minimum protocol version
+        tls_ver = d.get("minimum_protocol_version", "")
+        if tls_ver in ("SSLv3", "TLSv1", "TLSv1_2016", "TLSv1.1_2016"):
+            findings.append(finding(
+                "security", "CloudFront", "global", f"{dist_id} ({domain})",
+                f"Outdated TLS minimum protocol version ({tls_ver}) — upgrade to TLSv1.2",
+                "high"
+            ))
+
+    return findings
+
+
 ALL_CHECKS = [
     # Security
     check_security_ec2_public_ips,
@@ -2022,6 +2151,8 @@ ALL_CHECKS = [
     check_security_amg_auth,
     check_security_documentdb,
     check_security_workspaces_unencrypted,
+    check_security_cloudfront,
+    check_security_s3,
     # Cost
     check_cost_ec2_stopped,
     check_cost_nat_gateways,
@@ -2082,67 +2213,110 @@ ALL_CHECKS = [
 # MAIN
 # ============================================================
 
-def main():
-    parser = argparse.ArgumentParser(description='AWS Resource Audit — Security, Cost, Reliability & Drift')
-    parser.add_argument('--account-id', '-a', default=None,
-                        help='Check specific account (default: all in output/)')
-    parser.add_argument('--days', '-d', type=int, default=90,
-                        help='Staleness threshold in days (default: 90)')
-    parser.add_argument('--json', action='store_true',
-                        help='Output as JSON (for presentations/reports)')
-    parser.add_argument('--severity', '-s', default=None,
-                        choices=['critical', 'high', 'medium', 'low', 'info'],
-                        help='Minimum severity to show (this level and everything more severe)')
-    parser.add_argument('--category', '-c', default=None,
-                        choices=['security', 'cost', 'reliability', 'drift'],
-                        help='Filter by category')
-    parser.add_argument('--live-pricing', action='store_true',
-                        help='Use live AWS Pricing API for cost estimates (needs --profile)')
-    parser.add_argument('--profile', '-p', default=None,
-                        help='AWS profile for --live-pricing (Pricing API is free/read-only)')
-    args = parser.parse_args()
+def resolve_target_account(account_arg=None, profile_arg=None):
+    """Resolve target account ID from -a, -p, or available directories in output/."""
+    from common import get_accounts, create_session_with_identity
 
-    # Optional: live pricing via AWS Pricing API
-    if args.live_pricing:
-        if not args.profile:
-            print("ERROR: --live-pricing requires --profile")
-            sys.exit(1)
-        global _SESSION
-        from common import create_session
-        _SESSION = create_session(args.profile)
-        if _SESSION is None:
-            print(f"ERROR: could not create session for profile {args.profile}")
-            sys.exit(1)
-        print(f"  💲 Live pricing enabled via profile {args.profile}")
+    if account_arg:
+        if re.match(r'^\d{12}$', str(account_arg)):
+            return str(account_arg)
+        try:
+            matched = get_accounts(account_arg)
+            if matched:
+                return matched[0]["account_id"]
+        except Exception:
+            pass
+        return str(account_arg)
 
-    if not OUTPUT_DIR.exists():
-        print(f"ERROR: {OUTPUT_DIR} does not exist. Run inventory scripts first.")
+    if profile_arg:
+        if re.match(r'^\d{12}$', profile_arg):
+            return profile_arg
+        match = re.match(r'^(\d{12})', profile_arg)
+        if match:
+            return match.group(1)
+        try:
+            matched = [a for a in get_accounts() if a.get("profile") == profile_arg]
+            if matched:
+                return matched[0]["account_id"]
+        except Exception:
+            pass
+        try:
+            _, acct_id, _ = create_session_with_identity(profile_arg)
+            if acct_id:
+                return acct_id
+        except Exception:
+            pass
+
+    # Fallback: scan valid 12-digit account folders under output/
+    candidates = [d.name for d in OUTPUT_DIR.iterdir()
+                  if d.is_dir() and re.match(r'^\d{12}$', d.name)]
+    if len(candidates) == 1:
+        return candidates[0]
+    elif len(candidates) > 1:
+        print("ERROR: multiple accounts found in output/ — specify one with -a <account_id|name> or -p <profile>:")
+        for c in sorted(candidates):
+            print(f"  {c}")
+        sys.exit(1)
+    else:
+        print("ERROR: No account inventory output found under output/. Run inventory scripts first.")
         sys.exit(1)
 
-    # Single-account by design. Resolve the one account dir to audit:
-    # explicit -a, else infer when exactly one account exists in output/.
-    account_id = args.account_id
-    if not account_id:
-        candidates = [d.name for d in OUTPUT_DIR.iterdir()
-                      if d.is_dir() and d.name not in ("combined", "audit")]
-        if len(candidates) == 1:
-            account_id = candidates[0]
-        elif len(candidates) > 1:
-            print("ERROR: multiple accounts in output/ — specify one with -a <account_id>:")
-            for c in sorted(candidates):
-                print(f"  {c}")
-            sys.exit(1)
-        else:
-            print("ERROR: No inventory output found. Run inventory scripts first.")
-            sys.exit(1)
 
+def generate_markdown_report(output_data: dict, output_path: Path):
+    """Generate a clean GitHub/Notion flavored Markdown summary."""
+    account_id = output_data.get("account_id")
+    total_findings = output_data.get("total_findings", 0)
+    waste = output_data.get("estimated_monthly_waste_usd", 0)
+    sev_counts = output_data.get("findings_by_severity", {})
+    cat_counts = output_data.get("findings_by_category", {})
+    top_costs = output_data.get("top_cost_savings", [])
+    findings = output_data.get("findings", [])
+
+    lines = [
+        f"# AWS Resource Audit Report — Account `{account_id}`",
+        f"\n**Generated**: `{output_data.get('generated')}` | **Staleness Threshold**: `{output_data.get('staleness_threshold_days')} days`\n",
+        "## 📊 Executive Summary\n",
+        "| Metric | Value |",
+        "| :--- | :--- |",
+        f"| **Account ID** | `{account_id}` |",
+        f"| **Total Findings** | **{total_findings}** |",
+        f"| **Est. Monthly Waste** | **${waste:,.2f} / mo** (${waste * 12:,.2f}/yr) |",
+        f"| **Severity Breakdown** | 🔴 `{sev_counts.get('critical', 0)} Critical` | 🟠 `{sev_counts.get('high', 0)} High` | 🟡 `{sev_counts.get('medium', 0)} Medium` | 🔵 `{sev_counts.get('low', 0)} Low` | ⚪ `{sev_counts.get('info', 0)} Info` |",
+        f"| **Category Breakdown** | 🔒 `{cat_counts.get('security', 0)} Security` | 💰 `{cat_counts.get('cost', 0)} Cost` | ⚙️ `{cat_counts.get('reliability', 0)} Reliability` | 🧹 `{cat_counts.get('drift', 0)} Drift` |\n",
+    ]
+
+    if top_costs:
+        lines.extend([
+            "## 💡 Top Cost Reduction Opportunities\n",
+            "| Est. Waste | Service | Resource | Issue |",
+            "| :--- | :--- | :--- | :--- |",
+        ])
+        for f in top_costs[:15]:
+            lines.append(f"| **${f.get('est_monthly_waste_usd', 0):,.0f}/mo** | `{f.get('service')}` | `{f.get('resource')}` | {f.get('issue')} |")
+        lines.append("")
+
+    critical_high = [f for f in findings if f.get("severity") in ("critical", "high")]
+    if critical_high:
+        lines.extend([
+            "## 🔴 Critical & High Findings Checklist\n",
+            "| Severity | Category | Service | Region | Resource | Issue |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- |",
+        ])
+        for f in critical_high:
+            sev_badge = "🔴 `CRITICAL`" if f.get("severity") == "critical" else "🟠 `HIGH`"
+            lines.append(f"| {sev_badge} | {f.get('category').capitalize()} | `{f.get('service')}` | `{f.get('region')}` | `{f.get('resource')}` | {f.get('issue')} |")
+        lines.append("")
+
+    with open(output_path, 'w') as f:
+        f.write("\n".join(lines))
+
+
+def audit_single_account(account_id: str, args, severity_order: dict, min_severity: int):
+    """Run full audit for a single account directory and save reports."""
     account_dir = OUTPUT_DIR / account_id
     if not account_dir.exists():
         print(f"ERROR: No output found for account {account_id}")
-        sys.exit(1)
-
-    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-    min_severity = severity_order.get(args.severity, 4) if args.severity else 4
+        return None
 
     all_findings = []
     for check_fn in ALL_CHECKS:
@@ -2153,10 +2327,8 @@ def main():
                     continue
                 all_findings.append(f)
 
-    # Calculate estimated savings
     total_est_savings = sum(f.get("est_monthly_waste_usd", 0) for f in all_findings)
 
-    # Always save JSON report to output/audit/
     output_data = {
         "generated": datetime.now(timezone.utc).isoformat(),
         "account_id": account_id,
@@ -2182,102 +2354,200 @@ def main():
     audit_dir = OUTPUT_DIR / "audit"
     audit_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    audit_file = audit_dir / f"audit-report-{account_id}-{timestamp}.json"
-    with open(audit_file, 'w') as f:
+    audit_json = audit_dir / f"audit-report-{account_id}-{timestamp}.json"
+    with open(audit_json, 'w') as f:
         json.dump(output_data, f, indent=2, default=str, ensure_ascii=False)
-    print(f"  📄 Saved: {audit_file}")
+    print(f"  📄 Saved JSON: {audit_json}")
 
-    if args.json:
-        print(json.dumps(output_data, indent=2, default=str))
+    audit_md = audit_dir / f"audit-report-{account_id}-{timestamp}.md"
+    generate_markdown_report(output_data, audit_md)
+    print(f"  📝 Saved Markdown: {audit_md}")
+
+    return output_data
+
+
+def main():
+    parser = argparse.ArgumentParser(description='AWS Resource Audit — Security, Cost, Reliability & Drift')
+    parser.add_argument('--account-id', '-a', default=None,
+                        help='Check specific account (ID, Name, or Alias)')
+    parser.add_argument('--all', action='store_true',
+                        help='Audit all accounts discovered in output/')
+    parser.add_argument('--days', '-d', type=int, default=90,
+                        help='Staleness threshold in days (default: 90)')
+    parser.add_argument('--json', action='store_true',
+                        help='Output as JSON (for presentations/reports)')
+    parser.add_argument('--markdown', '-m', action='store_true',
+                        help='Print Markdown report to stdout')
+    parser.add_argument('--severity', '-s', default=None,
+                        choices=['critical', 'high', 'medium', 'low', 'info'],
+                        help='Minimum severity to show (this level and everything more severe)')
+    parser.add_argument('--category', '-c', default=None,
+                        choices=['security', 'cost', 'reliability', 'drift'],
+                        help='Filter by category')
+    parser.add_argument('--live-pricing', action='store_true',
+                        help='Use live AWS Pricing API for cost estimates (needs --profile)')
+    parser.add_argument('--profile', '-p', default=None,
+                        help='AWS profile for --live-pricing or account resolution (Pricing API is free/read-only)')
+    args = parser.parse_args()
+
+    # Optional: live pricing via AWS Pricing API
+    if args.live_pricing:
+        if not args.profile:
+            print("ERROR: --live-pricing requires --profile")
+            sys.exit(1)
+        global _SESSION
+        from common import create_session
+        _SESSION = create_session(args.profile)
+        if _SESSION is None:
+            print(f"ERROR: could not create session for profile {args.profile}")
+            sys.exit(1)
+        print(f"  💲 Live pricing enabled via profile {args.profile}")
+
+    if not OUTPUT_DIR.exists():
+        print(f"ERROR: {OUTPUT_DIR} does not exist. Run inventory scripts first.")
+        sys.exit(1)
+
+    severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+    min_severity = severity_order.get(args.severity, 4) if args.severity else 4
+
+    # Determine accounts to audit
+    accounts_to_audit = []
+    if args.all:
+        accounts_to_audit = sorted([d.name for d in OUTPUT_DIR.iterdir()
+                                    if d.is_dir() and re.match(r'^\d{12}$', d.name)])
+        if not accounts_to_audit:
+            print("ERROR: No valid account directories found under output/")
+            sys.exit(1)
     else:
-        # Console report
-        print()
+        acct_id = resolve_target_account(args.account_id, args.profile)
+        accounts_to_audit = [acct_id]
+
+    multi_reports = []
+    for acct_id in accounts_to_audit:
+        print(f"\n🔍 Auditing Account: {acct_id}")
+        output_data = audit_single_account(acct_id, args, severity_order, min_severity)
+        if output_data:
+            multi_reports.append(output_data)
+
+            if len(accounts_to_audit) == 1:
+                all_findings = output_data["findings"]
+                total_est_savings = output_data["estimated_monthly_waste_usd"]
+
+                if args.json:
+                    print(json.dumps(output_data, indent=2, default=str))
+                elif args.markdown:
+                    audit_dir = OUTPUT_DIR / "audit"
+                    latest_md = sorted(glob.glob(str(audit_dir / f"audit-report-{acct_id}-*.md")), reverse=True)[0]
+                    with open(latest_md) as f:
+                        print(f.read())
+                else:
+                    # Console report
+                    print()
+                    print("=" * 90)
+                    print("  AWS RESOURCE AUDIT REPORT")
+                    print("  Security • Cost • Reliability • Drift")
+                    print("=" * 90)
+                    print(f"  Account:               {acct_id}")
+                    print(f"  Staleness threshold:   {args.days} days")
+                    print(f"  Total findings:        {len(all_findings)}")
+                    if total_est_savings > 0:
+                        print(f"  💰 Est. monthly waste: ${total_est_savings:,.0f}/mo")
+                    print()
+
+                    category_icons = {"security": "🔒", "cost": "💰", "reliability": "⚙️", "drift": "🧹"}
+                    print("  📊 BY CATEGORY:")
+                    for cat in ["security", "cost", "reliability", "drift"]:
+                        count = sum(1 for f in all_findings if f["category"] == cat)
+                        if count:
+                            icon = category_icons[cat]
+                            print(f"    {icon} {cat.upper():<14} {count:>5} findings")
+                    print()
+
+                    print("  📊 BY SEVERITY:")
+                    severity_icons = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵", "info": "⚪"}
+                    for sev in ["critical", "high", "medium", "low", "info"]:
+                        count = sum(1 for f in all_findings if f["severity"] == sev)
+                        if count:
+                            print(f"    {severity_icons[sev]} {sev.upper():<10} {count:>5}")
+                    print()
+
+                    cost_findings = sorted(
+                        [f for f in all_findings if f.get("est_monthly_waste_usd", 0) > 0],
+                        key=lambda x: x["est_monthly_waste_usd"], reverse=True
+                    )[:10]
+                    if cost_findings:
+                        print("  💡 TOP COST REDUCTION OPPORTUNITIES:")
+                        print(f"  {'─' * 86}")
+                        for f in cost_findings:
+                            print(f"    ${f['est_monthly_waste_usd']:>8,.0f}/mo  {f['service']:<18} {f['resource'][:40]:<40} {f['issue'][:40]}")
+                        print()
+
+                    for cat in ["security", "cost", "reliability", "drift"]:
+                        items = [f for f in all_findings if f["category"] == cat]
+                        if not items:
+                            continue
+
+                        icon = category_icons[cat]
+                        print(f"  {icon} {cat.upper()} ({len(items)} findings)")
+                        print(f"  {'━' * 86}")
+
+                        for sev in ["critical", "high", "medium", "low", "info"]:
+                            sev_items = [f for f in items if f["severity"] == sev]
+                            if not sev_items:
+                                continue
+                            print(f"    {severity_icons[sev]} {sev.upper()} ({len(sev_items)})")
+                            for f in sev_items[:25]:
+                                region = f.get("region", "global")[:12]
+                                resource = f["resource"][:35]
+                                issue = f["issue"][:50]
+                                print(f"      [{region:<12}] {f['service']:<16} {resource:<35} {issue}")
+                            if len(sev_items) > 25:
+                                print(f"      ... and {len(sev_items) - 25} more")
+                        print()
+
+                    print("  " + "=" * 86)
+                    print("  📋 RECOMMENDED ACTIONS:")
+                    print("  " + "=" * 86)
+
+                    critical_count = sum(1 for f in all_findings if f["severity"] == "critical")
+                    high_count = sum(1 for f in all_findings if f["severity"] == "high")
+
+                    if critical_count:
+                        print(f"  1. 🔴 Fix {critical_count} CRITICAL issues immediately (security exposure, expired certs)")
+                    if high_count:
+                        print(f"  2. 🟠 Address {high_count} HIGH issues this sprint (no HA, stale credentials, deprecated runtimes)")
+                    if total_est_savings > 100:
+                        print(f"  3. 💰 Review cost waste — est. ${total_est_savings:,.0f}/mo savings possible")
+
+                    stopped_ec2 = sum(1 for f in all_findings if f["service"] == "EC2" and "Stopped" in f["issue"])
+                    if stopped_ec2:
+                        print(f"  4. 🛑 {stopped_ec2} stopped EC2 instances — terminate or snapshot+delete EBS")
+
+                    print()
+
+    # Multi-account consolidated summary table
+    if len(multi_reports) > 1:
+        print("\n" + "=" * 90)
+        print("  🌐 MULTI-ACCOUNT AUDIT SUMMARY")
         print("=" * 90)
-        print("  AWS RESOURCE AUDIT REPORT")
-        print("  Security • Cost • Reliability • Drift")
-        print("=" * 90)
-        print(f"  Account:               {account_id}")
-        print(f"  Staleness threshold:   {args.days} days")
-        print(f"  Total findings:        {len(all_findings)}")
-        if total_est_savings > 0:
-            print(f"  💰 Est. monthly waste: ${total_est_savings:,.0f}/mo")
-        print()
+        print(f"  {'Account ID':<16} {'Total':<8} {'Critical':<10} {'High':<8} {'Medium':<8} {'Est. Waste/Mo':<15}")
+        print(f"  {'-' * 86}")
+        total_all_waste = 0
+        total_all_findings = 0
+        for r in multi_reports:
+            acct = r['account_id']
+            tot = r['total_findings']
+            crit = r['findings_by_severity'].get('critical', 0)
+            hi = r['findings_by_severity'].get('high', 0)
+            med = r['findings_by_severity'].get('medium', 0)
+            w = r['estimated_monthly_waste_usd']
+            total_all_waste += w
+            total_all_findings += tot
+            print(f"  {acct:<16} {tot:<8} {crit:<10} {hi:<8} {med:<8} ${w:>10,.2f}/mo")
 
-        # Category summary
-        category_icons = {"security": "🔒", "cost": "💰", "reliability": "⚙️", "drift": "🧹"}
-        print("  📊 BY CATEGORY:")
-        for cat in ["security", "cost", "reliability", "drift"]:
-            count = sum(1 for f in all_findings if f["category"] == cat)
-            if count:
-                icon = category_icons[cat]
-                print(f"    {icon} {cat.upper():<14} {count:>5} findings")
-        print()
-
-        # Severity summary
-        print("  📊 BY SEVERITY:")
-        severity_icons = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🔵", "info": "⚪"}
-        for sev in ["critical", "high", "medium", "low", "info"]:
-            count = sum(1 for f in all_findings if f["severity"] == sev)
-            if count:
-                print(f"    {severity_icons[sev]} {sev.upper():<10} {count:>5}")
-        print()
-
-        # Top cost savings
-        cost_findings = sorted(
-            [f for f in all_findings if f.get("est_monthly_waste_usd", 0) > 0],
-            key=lambda x: x["est_monthly_waste_usd"], reverse=True
-        )[:10]
-        if cost_findings:
-            print("  💡 TOP COST REDUCTION OPPORTUNITIES:")
-            print(f"  {'─' * 86}")
-            for f in cost_findings:
-                print(f"    ${f['est_monthly_waste_usd']:>8,.0f}/mo  {f['service']:<18} {f['resource'][:40]:<40} {f['issue'][:40]}")
-            print()
-
-        # Details by category + severity
-        for cat in ["security", "cost", "reliability", "drift"]:
-            items = [f for f in all_findings if f["category"] == cat]
-            if not items:
-                continue
-
-            icon = category_icons[cat]
-            print(f"  {icon} {cat.upper()} ({len(items)} findings)")
-            print(f"  {'━' * 86}")
-
-            for sev in ["critical", "high", "medium", "low", "info"]:
-                sev_items = [f for f in items if f["severity"] == sev]
-                if not sev_items:
-                    continue
-                print(f"    {severity_icons[sev]} {sev.upper()} ({len(sev_items)})")
-                for f in sev_items[:25]:
-                    region = f.get("region", "global")[:12]
-                    resource = f["resource"][:35]
-                    issue = f["issue"][:50]
-                    print(f"      [{region:<12}] {f['service']:<16} {resource:<35} {issue}")
-                if len(sev_items) > 25:
-                    print(f"      ... and {len(sev_items) - 25} more")
-            print()
-
-        # Action summary
-        print("  " + "=" * 86)
-        print("  📋 RECOMMENDED ACTIONS:")
-        print("  " + "=" * 86)
-
-        critical_count = sum(1 for f in all_findings if f["severity"] == "critical")
-        high_count = sum(1 for f in all_findings if f["severity"] == "high")
-
-        if critical_count:
-            print(f"  1. 🔴 Fix {critical_count} CRITICAL issues immediately (security exposure, expired certs)")
-        if high_count:
-            print(f"  2. 🟠 Address {high_count} HIGH issues this sprint (no HA, stale credentials, deprecated runtimes)")
-        if total_est_savings > 100:
-            print(f"  3. 💰 Review cost waste — est. ${total_est_savings:,.0f}/mo savings possible")
-
-        stopped_ec2 = sum(1 for f in all_findings if f["service"] == "EC2" and "Stopped" in f["issue"])
-        if stopped_ec2:
-            print(f"  4. 🛑 {stopped_ec2} stopped EC2 instances — terminate or snapshot+delete EBS")
-
-        print()
+        print(f"  {'-' * 86}")
+        print(f"  {'TOTAL':<16} {total_all_findings:<8} {'-':<10} {'-':<8} {'-':<8} ${total_all_waste:>10,.2f}/mo")
+        print("=" * 90 + "\n")
 
 
 if __name__ == "__main__":
