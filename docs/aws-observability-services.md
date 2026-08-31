@@ -57,15 +57,24 @@ signals built on them (**alerts**, **dashboards**, **events**).
 | **CloudWatch Internet Monitor** | Internet-path performance/availability | ✅ `internet_monitor` | — |
 | **CloudWatch Application Signals** | APM (SLOs, service map) over ADOT/X-Ray | ✅ `application_signals` | — |
 
-## Not yet covered by an inventory scanner
+## Account-event feed (not a resource inventory)
 
-Deliberately skipped — either deprecated or no per-resource control-plane API to inventory.
+| Service | What it does | Inventory | Audit |
+|---|---|---|---|
+| **AWS Health** | Open/upcoming service events affecting the account (maintenance, retirements, degradations) | ✅ `health` | — |
+
+`health` is an event feed, not a per-resource inventory — it captures the last 90 days
+plus upcoming events. Requires **Business/Enterprise Support**; on Basic/Developer it
+records `access: false` instead of erroring.
+
+## Not covered by a scanner (by design)
+
+Deliberately skipped — deprecated, or no control-plane API to inventory.
 
 | Service | What it does | Why skipped |
 |---|---|---|
-| **CloudWatch Evidently** | Feature flags + A/B experiments | Being deprecated by AWS |
-| **AWS Distro for OpenTelemetry (ADOT)** | OTel collector distro | Agent, not an API service — nothing to scan |
-| **AWS Health / Personal Health Dashboard** | Service events affecting your account | Health API, not resource inventory |
+| **CloudWatch Evidently** | Feature flags + A/B experiments | Being deprecated by AWS (end of support 2025) — building a scanner for a dead service is waste |
+| **AWS Distro for OpenTelemetry (ADOT)** | OTel collector distro | It's an agent you run on EC2/EKS/Lambda — no AWS API lists "your ADOT deployments", so there is nothing to scan. Workload coverage comes from the EKS/Lambda scanners. |
 | **AWS Managed Grafana – SAML/data sources** | Auth + data-source wiring detail | Partially covered by `amg_permissions` |
 
 ---
@@ -82,11 +91,12 @@ Deliberately skipped — either deprecated or no per-resource control-plane API 
 
 ## Coverage summary
 
-- **Inventory:** 19 observability services have scanners.
-- **Audit:** 13 have anomaly/cost checks in `tools/audit_aws_resources.py` —
-  CloudWatch, OpenSearch, CloudTrail, EventBridge, Config, GuardDuty, Inspector,
-  Security Hub, Security Lake, SNS, Kinesis, Synthetics, RUM.
-- **Inventory but no audit yet:** CloudWatch Alarms, X-Ray, AMP, AMG,
-  Internet Monitor, Application Signals.
-- **Gaps (no scanner):** Evidently (deprecated), ADOT (agent, no API), AWS Health
-  (event API, not inventory) — none are per-resource inventory targets.
+- **Inventory:** 20 observability services have scanners (incl. `health`).
+- **Audit:** 18 have anomaly/cost checks in `tools/audit_aws_resources.py` —
+  CloudWatch, CloudWatch Logs, X-Ray, AMP, AMG, OpenSearch, CloudTrail, EventBridge,
+  Config, GuardDuty, Inspector, Security Hub, Security Lake, SNS, Kinesis, Synthetics,
+  RUM, Internet Monitor.
+- **Inventory but no audit yet:** CloudWatch Alarms, Application Signals, AWS Health
+  (event feed — surfaced as-is, no anomaly rule).
+- **Not covered by a scanner (by design):** Evidently (deprecated) and ADOT
+  (agent, no control-plane API).
