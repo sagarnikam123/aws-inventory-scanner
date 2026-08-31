@@ -1828,6 +1828,54 @@ def check_reliability_internet_monitor(account_dir, days_threshold):
     return findings
 
 
+def check_reliability_health_events(account_dir, days_threshold):
+    """Open/upcoming AWS Health events needing attention — forced retirements,
+    scheduled changes, security notifications, and unresolved issues."""
+    findings = []
+    path = find_latest_inventory(account_dir, "health")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data or not data.get("access"):
+        return findings
+
+    events = data.get("events", {}).get("all", [])
+    for ev in events:
+        status = ev.get("status", "")
+        # Only actionable events — closed ones are history, not findings.
+        if status not in ("open", "upcoming"):
+            continue
+
+        category = ev.get("category", "")
+        service = ev.get("service", "")
+        region = ev.get("region", "global")
+        code = ev.get("event_type_code", "")
+
+        # Forced lifecycle/retirement changes are the ones that break things
+        # if ignored (version EOL, mandatory reboots, patch retirements).
+        if category == "scheduledChange":
+            when = days_until(ev.get("start_time"))
+            when_str = f"in {when}d" if when is not None and when >= 0 else "scheduled"
+            findings.append(finding(
+                "reliability", "Health", region, f"{service}: {code}",
+                f"Scheduled change {when_str} — plan for it or resources may be affected",
+                "high" if (when is not None and 0 <= when <= 30) else "medium"
+            ))
+        elif category == "issue":
+            findings.append(finding(
+                "reliability", "Health", region, f"{service}: {code}",
+                "Open AWS issue affecting your resources",
+                "high"
+            ))
+        elif "SECURITY" in code.upper():
+            findings.append(finding(
+                "security", "Health", region, f"{service}: {code}",
+                "Open AWS security notification — review required",
+                "high"
+            ))
+    return findings
+
+
 def check_reliability_security_lake(account_dir, days_threshold):
     """Security Lake posture: weak encryption, no replication, no retention, dead subscribers."""
     findings = []
@@ -2013,6 +2061,7 @@ ALL_CHECKS = [
     check_reliability_synthetics,
     check_reliability_amp_status,
     check_reliability_internet_monitor,
+    check_reliability_health_events,
     # Drift / Hygiene
     check_drift_rum_no_sampling,
     check_drift_untagged_ec2,
