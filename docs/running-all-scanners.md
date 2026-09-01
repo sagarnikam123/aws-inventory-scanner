@@ -7,8 +7,8 @@ so one runner can drive all of them for a single account.
 
 | Arg | Short | Meaning |
 |-----|-------|---------|
-| `--profile` | `-p` | AWS profile to use directly (bypasses `accounts.yaml`). Account ID auto-detected via STS. |
-| `--account` | `-a` | Filter to an account (ID / name / profile) from `accounts.yaml`. |
+| `--profile` | `-p` | AWS profile to use directly (bypasses `accounts.yaml`). Omit it to use the AWS CLI `[default]` profile; account ID is auto-detected via STS. |
+| `--account` | `-a` | Filter to an account (ID / name / profile) from `accounts.yaml`; this preserves accounts.yaml mode when no profile is supplied. |
 | `--region` | `-r` | Limit to one region. Omit = all regions the service supports. |
 | `--output-dir` | `-o` | Custom output directory (default `output/<account_id>/<service>`). |
 
@@ -24,7 +24,8 @@ These take extra **optional** flags — they still run fine with just `-p`:
 | `get_amg_permissions.py` | `--workspace` | Target one Grafana workspace |
 
 Because the extras are optional, the runner drives every script with just
-`-p <profile>` (and optional `-r <region>`).
+`-p <profile>` (and optional `-r <region>`); standalone scripts also use the
+AWS CLI `[default]` profile when `-p` and `-a` are omitted.
 
 ## The runner: `run_inventory.sh`
 
@@ -33,8 +34,11 @@ Runs all scanners N at a time. A failing scanner is warned to the console but
 
 ```bash
 cp conf/.env.example conf/.env    # edit AWS_PROFILE, PARALLEL, etc.
-./run_inventory.sh
+./run_inventory.sh                  # uses the AWS CLI [default] profile if omitted
 ```
+
+`AWS_PROFILE` is optional. When omitted or empty, the runner uses the AWS CLI
+`[default]` profile.
 
 Inline override (no conf/.env needed):
 
@@ -46,7 +50,7 @@ AWS_PROFILE=123456789012_AdministratorAccess PARALLEL=4 ./run_inventory.sh
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `AWS_PROFILE` | — (required) | Profile to scan |
+| `AWS_PROFILE` | `default` | Optional profile to scan; empty or omitted uses the AWS CLI `[default]` profile |
 | `AWS_REGION` | all | Limit to one region |
 | `PARALLEL` | `2` | Scanners to run concurrently |
 | `ONLY` | all | Comma-separated scripts to run (e.g. `get_ec2_inventory.py,get_s3_inventory.py`) |

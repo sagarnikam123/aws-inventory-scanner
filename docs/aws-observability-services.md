@@ -4,7 +4,9 @@ Reference list of AWS services relevant to observability — metrics, logs, trac
 alerting, and the managed open-source stack.
 
 The **Inventory script** column names the scanner in `inventory/` that collects
-that service. Run any of them with `-p <profile>` (single account) or `-a <account>`.
+that service. Run any of them without profile flags to use the AWS CLI `[default]`
+profile, or use `-p <profile>` for a specific profile and `-a <account>` for
+accounts.yaml selection.
 
 Observability = the three pillars (**metrics**, **logs**, **traces**) plus the
 signals built on them (**alerts**, **dashboards**, **events**).

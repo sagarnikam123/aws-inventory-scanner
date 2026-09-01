@@ -23,7 +23,7 @@ pip install boto3 pyyaml
 cp conf/accounts.yaml.example conf/accounts.yaml
 # Edit conf/accounts.yaml with your real account IDs and profiles
 
-# Single service, all accounts in accounts.yaml
+# Single service using the AWS CLI [default] profile
 python inventory/get_ec2_inventory.py
 
 # Single account (by name from accounts.yaml)
@@ -43,13 +43,15 @@ scanner is warned to the console but never stops the run.
 
 ```bash
 cp conf/.env.example conf/.env     # set AWS_PROFILE, PARALLEL, etc.
-./run_inventory.sh
+./run_inventory.sh                  # uses the AWS CLI [default] profile if omitted
 
 # or override inline (no conf/.env needed)
 AWS_PROFILE=123456789012_AdministratorAccess PARALLEL=4 ./run_inventory.sh
 ```
 
-Config lives in `conf/.env` (`AWS_PROFILE`, `AWS_REGION`, `PARALLEL`, `ONLY`, `SKIP`).
+`AWS_PROFILE` is optional. When omitted or empty, the runner uses the AWS CLI
+`[default]` profile. Config lives in `conf/.env` (`AWS_PROFILE`, `AWS_REGION`,
+`PARALLEL`, `ONLY`, `SKIP`).
 Per-script logs go to `output/_run_logs/`. Full details and the shared-args
 reference: [docs/running-all-scanners.md](docs/running-all-scanners.md).
 
