@@ -64,7 +64,10 @@ if accts:
   [[ -n "$RESOLVED_PROF" ]] && AWS_PROFILE="$RESOLVED_PROF"
 fi
 
-: "${AWS_PROFILE:?Set AWS_PROFILE via -p <profile> or in conf/.env (see conf/.env.example)}"
+# Use the AWS CLI [default] profile when no profile was supplied through
+# the shell, conf/.env, -p/--profile, or account lookup.
+AWS_PROFILE="${AWS_PROFILE:-default}"
+export AWS_PROFILE
 PARALLEL="${PARALLEL:-2}"
 AWS_REGION="${AWS_REGION:-}"
 ONLY="${ONLY:-}"

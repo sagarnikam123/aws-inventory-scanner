@@ -259,7 +259,7 @@ def create_session_with_identity(profile: str) -> tuple:
 
 
 def add_common_args(parser):
-    """Add common CLI arguments to an argparse parser."""
+    """Add common CLI arguments and default standalone scans to AWS [default]."""
     parser.add_argument(
         '--account', '-a',
         help='Filter to specific account (ID, name, or profile) from accounts.yaml. Omit to scan all.',
@@ -280,6 +280,18 @@ def add_common_args(parser):
         help='Custom output directory (default: ./output/<account_id>/<service>)',
         default=None
     )
+
+    # ponytail: one shared parse hook avoids 73 duplicate defaulting blocks;
+    # --account remains the explicit accounts.yaml/multi-account path.
+    original_parse_args = parser.parse_args
+
+    def parse_args(args=None, namespace=None):
+        parsed = original_parse_args(args, namespace)
+        if parsed.profile is None and parsed.account is None:
+            parsed.profile = os.environ.get('AWS_PROFILE') or 'default'
+        return parsed
+
+    parser.parse_args = parse_args
     return parser
 
 
