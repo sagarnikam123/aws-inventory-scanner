@@ -26,6 +26,7 @@ For tools that hit AWS live (`backup_amg_workspaces.py`), authenticate first, e.
 | `audit_aws_resources.py` | Security / cost / reliability / drift findings from inventory JSON |
 | `backup_amg_workspaces.py` | Back up Amazon Managed Grafana workspaces before a version upgrade (live API) |
 | `check_eks_vpc_connectivity.py` | Map EKS clusters to VPCs and compute cross-cluster connectivity |
+| `generate_service_cost_breakdown.py` | Generate comprehensive per-service tabular charts and markdown reports from cost inventory |
 | `get_eks_unique_deployments.py` | List unique deployment/service names from a k8s-workloads inventory |
 | `get_eks_unique_namespaces.py` | List unique namespace names from a k8s-workloads inventory |
 | `get_eks_workloads_xls.py` | Excel report of namespaces → deployments → clusters |
@@ -49,6 +50,12 @@ python tools/backup_amg_workspaces.py -p 123456789012_AdministratorAccess --only
 ```bash
 python tools/check_eks_vpc_connectivity.py
 python tools/check_eks_vpc_connectivity.py -a 123456789012
+```
+
+**generate_service_cost_breakdown.py** — generate per-service cost breakdown markdown report:
+```bash
+python tools/generate_service_cost_breakdown.py -a 123456789012
+python tools/generate_service_cost_breakdown.py -i output/123456789012/cost/cost-inventory-YYYYMMDD-HHMMSS.json
 ```
 
 **get_eks_unique_deployments.py** — list unique deployments from a workloads inventory:
