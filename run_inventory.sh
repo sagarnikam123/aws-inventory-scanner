@@ -137,8 +137,12 @@ run_one() {
   local log="$logdir/${name}.log"
   local status_file="$statusdir/${name}.status"
   local ra=(); [[ -n "$region" ]] && ra=(-r "$region")
+  local extra_args=()
+  if [[ "$script" == "get_s3_inventory.py" ]]; then
+    extra_args=(--metrics)
+  fi
 
-  if python3 "$invdir/$script" -p "$profile" "${ra[@]}" > "$log" 2>&1; then
+  if python3 "$invdir/$script" -p "$profile" "${ra[@]}" "${extra_args[@]}" > "$log" 2>&1; then
     echo "ok" > "$status_file"
     echo "$idx/$total - ✅ $script"
   else
