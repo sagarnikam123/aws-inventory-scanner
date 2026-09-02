@@ -52,10 +52,14 @@ python tools/check_eks_vpc_connectivity.py
 python tools/check_eks_vpc_connectivity.py -a 123456789012
 ```
 
-**generate_service_cost_breakdown.py** — generate per-service cost breakdown markdown report:
+**generate_service_cost_breakdown.py** — generate per-service tabular cost markdown reports:
 ```bash
-python tools/generate_service_cost_breakdown.py -a 123456789012
+python tools/generate_service_cost_breakdown.py                         # automatically scan ALL accounts in output/
+python tools/generate_service_cost_breakdown.py -a 123456789012        # by account ID (-a / -id / --id)
+python tools/generate_service_cost_breakdown.py -p 123456789012_Admin  # by profile name
+python tools/generate_service_cost_breakdown.py --path output/123456789012/cost/  # by directory
 python tools/generate_service_cost_breakdown.py -i output/123456789012/cost/cost-inventory-YYYYMMDD-HHMMSS.json
+# Outputs saved to: output/cost-breakdown/<account_id>/service-cost-breakdown-<account_id>-<timestamp>.md
 ```
 
 **get_eks_unique_deployments.py** — list unique deployments from a workloads inventory:
