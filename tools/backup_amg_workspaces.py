@@ -17,16 +17,16 @@ Auth model:
 
 Usage:
     # Back up every 9.4 workspace found in the latest amg inventory (primary path):
-    python tools/backup_amg_workspaces.py -p 853268358782_AdministratorAccess --only-version 9.4
+    python tools/backup_amg_workspaces.py -p 123456789012_AdministratorAccess --only-version 9.4
 
     # Back up specific workspace IDs:
-    python tools/backup_amg_workspaces.py -p <profile> -w g-447d41032c -w g-cccbe09412
+    python tools/backup_amg_workspaces.py -p <profile> -w g-1234567890 -w g-0987654321
 
     # Back up ALL workspaces regardless of version:
     python tools/backup_amg_workspaces.py -p <profile>
 
     # Resolve the account/profile via accounts.yaml instead of a raw profile:
-    python tools/backup_amg_workspaces.py -a 853268358782 --only-version 9.4
+    python tools/backup_amg_workspaces.py -a 123456789012 --only-version 9.4
 
 Output:
     output/<account_id>/amg-backup/<timestamp>/<workspace_id>/
