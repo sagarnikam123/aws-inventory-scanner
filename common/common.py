@@ -73,49 +73,63 @@ def get_accounts(filter_account: Optional[str] = None) -> List[Dict[str, str]]:
 _ENABLED_REGIONS = None
 
 
-def get_enabled_regions() -> List[str]:
+def get_enabled_regions(session: Optional[boto3.Session] = None) -> List[str]:
     """Get list of active/enabled AWS regions for the current environment."""
     global _ENABLED_REGIONS
-    if _ENABLED_REGIONS is not None:
+    if _ENABLED_REGIONS is not None and not session:
         return _ENABLED_REGIONS
 
+    sess = session or boto3.Session()
+
     try:
-        ec2 = boto3.client('ec2', region_name='us-east-1', config=BOTO_CONFIG)
+        ec2 = sess.client('ec2', region_name='us-east-1', config=BOTO_CONFIG)
         response = ec2.describe_regions(AllRegions=False)
-        _ENABLED_REGIONS = [r['RegionName'] for r in response.get('Regions', [])]
-        if _ENABLED_REGIONS:
+        regions = [r['RegionName'] for r in response.get('Regions', [])]
+        if regions:
+            if not session:
+                _ENABLED_REGIONS = regions
+            return regions
+    except Exception:
+        pass
+
+    # Fallback to accounts.yaml static list if present
+    try:
+        config = load_accounts()
+        cfg_regions = config.get("regions")
+        if cfg_regions:
+            _ENABLED_REGIONS = cfg_regions
             return _ENABLED_REGIONS
     except Exception:
         pass
 
-    # Fallback to accounts.yaml static list
+    # Fallback to all standard AWS commercial regions via boto3 data model (offline, no auth needed)
     try:
-        config = load_accounts()
-        _ENABLED_REGIONS = config.get("regions", ["us-east-1"])
+        available = sess.get_available_regions('ec2')
+        if available:
+            _ENABLED_REGIONS = available
+            return available
     except Exception:
-        _ENABLED_REGIONS = ["us-east-1"]
+        pass
+
+    _ENABLED_REGIONS = ["us-east-1"]
     return _ENABLED_REGIONS
 
 
-def get_regions(service: str = None) -> List[str]:
+def get_regions(service: str = None, session: Optional[boto3.Session] = None) -> List[str]:
     """Get regions to scan.
-    If service is provided, returns only enabled regions where that service is available.
-    Otherwise returns all enabled AWS regions."""
-    enabled = get_enabled_regions()
+    If service is provided, returns available regions where that service is supported.
+    Otherwise returns all active AWS regions."""
+    sess = session or boto3.Session()
 
     if service:
         try:
-            session = boto3.Session()
-            available = set(session.get_available_regions(service))
+            available = sess.get_available_regions(service)
             if available:
-                # Intersect enabled regions with service available regions
-                filtered = [r for r in enabled if r in available]
-                if filtered:
-                    return filtered
+                return available
         except Exception:
             pass
 
-    return enabled
+    return get_enabled_regions(sess)
 
 
 def _validate_profile_exists(profile: str) -> bool:
