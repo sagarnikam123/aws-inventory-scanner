@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common import (
     logger, BOTO_CONFIG, get_accounts, create_session,
-    get_output_dir, save_json, get_timestamp, add_common_args,
+    get_output_dir, get_timestamp, add_common_args,
     create_session_with_identity, run_with_timer,
     IncrementalWriter, make_output_filename,
 )
@@ -115,21 +115,26 @@ def get_bucket_metrics(session, bucket_name):
             "object_count": 0,
         }
 
-    # ponytail: query only StandardStorage for total size — covers 95%+ of buckets.
-    # Querying all 13 StorageType dimensions adds ~11 extra API calls per bucket.
-    size_value = _get_metric_value(
-        cw,
-        "BucketSizeBytes",
-        [
-            {"Name": "BucketName", "Value": bucket_name},
-            {"Name": "StorageType", "Value": "StandardStorage"},
-        ],
-        "Average",
-        start_time,
-        now,
-        86400,
-    )
-    total_size = int(size_value) if size_value is not None else 0
+    # Sum BucketSizeBytes across every storage type — a StandardStorage-only
+    # query reports 0 for IA/Glacier/Intelligent-Tiering buckets, which then
+    # escape the audit's size-based lifecycle checks. ponytail: one call per
+    # storage type; the per-bucket cost is bounded by the STORAGE_TYPES list.
+    total_size = 0
+    for storage_type in STORAGE_TYPES:
+        size_value = _get_metric_value(
+            cw,
+            "BucketSizeBytes",
+            [
+                {"Name": "BucketName", "Value": bucket_name},
+                {"Name": "StorageType", "Value": storage_type},
+            ],
+            "Average",
+            start_time,
+            now,
+            86400,
+        )
+        if size_value is not None:
+            total_size += int(size_value)
 
     object_count = _get_metric_value(
         cw,
@@ -445,6 +450,85 @@ def get_lifecycle_summary(s3_client, bucket_name):
     }
 
 
+def get_encryption_summary(s3_client, bucket_name):
+    """Return bucket default encryption status without treating API errors as unencrypted."""
+    try:
+        response = s3_client.get_bucket_encryption(Bucket=bucket_name)
+        rules = response.get("ServerSideEncryptionConfiguration", {}).get("Rules", [])
+        algorithms = [
+            rule.get("ApplyServerSideEncryptionByDefault", {}).get("SSEAlgorithm")
+            for rule in rules
+        ]
+        algorithms = [algorithm for algorithm in algorithms if algorithm]
+        return {
+            "enabled": bool(algorithms),
+            "algorithm": algorithms[0] if algorithms else None,
+            "status": "configured" if algorithms else "not_configured",
+        }
+    except Exception as error:
+        if _error_code(error) in (
+            "ServerSideEncryptionConfigurationNotFoundError",
+            "NoSuchBucket",
+        ):
+            return {"enabled": False, "algorithm": None, "status": "not_configured"}
+        return {
+            "enabled": None,
+            "algorithm": None,
+            "status": "unavailable",
+            "error_code": _error_code(error) or "unknown",
+        }
+
+
+def get_public_access_block_summary(s3_client, bucket_name):
+    """Return bucket Public Access Block configuration."""
+    try:
+        response = s3_client.get_public_access_block(Bucket=bucket_name)
+        pab = response.get("PublicAccessBlockConfiguration", {})
+        block_acls = pab.get("BlockPublicAcls", False)
+        ignore_acls = pab.get("IgnorePublicAcls", False)
+        block_policy = pab.get("BlockPublicPolicy", False)
+        restrict_buckets = pab.get("RestrictPublicBuckets", False)
+        return {
+            "status": "configured",
+            "block_public_acls": block_acls,
+            "ignore_public_acls": ignore_acls,
+            "block_public_policy": block_policy,
+            "restrict_public_buckets": restrict_buckets,
+            "all_blocked": all([block_acls, ignore_acls, block_policy, restrict_buckets]),
+        }
+    except Exception as error:
+        if _error_code(error) in ("NoSuchPublicAccessBlockConfiguration", "NoSuchBucket"):
+            return {
+                "status": "not_configured",
+                "block_public_acls": False,
+                "ignore_public_acls": False,
+                "block_public_policy": False,
+                "restrict_public_buckets": False,
+                "all_blocked": False,
+            }
+        return {
+            "status": "unavailable",
+            "all_blocked": None,
+            "error_code": _error_code(error) or "unknown",
+        }
+
+
+def get_versioning_summary(s3_client, bucket_name):
+    """Return bucket versioning status and MFA delete setting."""
+    try:
+        response = s3_client.get_bucket_versioning(Bucket=bucket_name)
+        status = response.get("Status", "Suspended")
+        return {
+            "status": status,
+            "enabled": status == "Enabled",
+            "mfa_delete": response.get("MfaDelete", "Disabled"),
+        }
+    except Exception as error:
+        if _error_code(error) == "NoSuchBucket":
+            return {"status": "not_configured", "enabled": False, "mfa_delete": "Disabled"}
+        return {"status": "unavailable", "enabled": None, "error_code": _error_code(error) or "unknown"}
+
+
 def get_object_lock_summary(s3_client, bucket_name):
     """Return default Object Lock retention where the bucket has it enabled."""
     try:
@@ -545,53 +629,69 @@ def _flush_bucket(writer, entry, lock):
         writer.set("buckets", data["buckets"])
 
 
-def _collect_single_bucket(session, s3_client, bucket, include_metrics, include_details):
-    """Collect all metrics/config for one bucket. Runs in a worker thread."""
-    bucket_name = bucket["Name"]
-    bucket_region = get_bucket_region(s3_client, bucket_name)
-    entry = {
-        "bucket_name": bucket_name,
-        "region": bucket_region,
-        "created": bucket.get("CreationDate", ""),
-    }
+def _collect_single_bucket(session, bucket, include_metrics, include_details):
+    """Collect all metrics/config for one bucket. Runs in a worker thread.
 
-    if include_metrics:
-        entry.update(get_bucket_metrics(session, bucket_name))
-        request_metrics = get_request_metrics(session, bucket_name)
-        if request_metrics.get("available"):
-            entry["request_metrics"] = request_metrics
-        entry["replication"] = get_replication_summary(s3_client, bucket_name, bucket_region)
-        entry["lifecycle"] = get_lifecycle_summary(s3_client, bucket_name)
+    Creates its own S3 client: botocore clients are not safe to share across
+    threads, so each worker gets a dedicated client.
+    """
+    s3_client = session.client("s3", config=BOTO_CONFIG)
+    try:
+        bucket_name = bucket["Name"]
+        bucket_region = get_bucket_region(s3_client, bucket_name)
+        entry = {
+            "bucket_name": bucket_name,
+            "region": bucket_region,
+            "created": str(bucket.get("CreationDate", "")) if bucket.get("CreationDate") else "",
+        }
+
+        if include_metrics:
+            entry.update(get_bucket_metrics(session, bucket_name))
+            request_metrics = get_request_metrics(session, bucket_name)
+            if request_metrics.get("available"):
+                entry["request_metrics"] = request_metrics
+            entry["public_access_block"] = get_public_access_block_summary(s3_client, bucket_name)
+            entry["versioning"] = get_versioning_summary(s3_client, bucket_name)
+            entry["replication"] = get_replication_summary(s3_client, bucket_name, bucket_region)
+            entry["lifecycle"] = get_lifecycle_summary(s3_client, bucket_name)
+            entry["encryption"] = get_encryption_summary(s3_client, bucket_name)
+            entry["object_lock"] = get_object_lock_summary(s3_client, bucket_name)
+            try:
+                tagging = s3_client.get_bucket_tagging(Bucket=bucket_name)
+                entry["tags"] = {t["Key"]: t["Value"] for t in tagging.get("TagSet", [])}
+            except Exception:
+                entry["tags"] = {}
+
+        if include_details:
+            entry["storage_lens"] = get_storage_lens_metrics(session, bucket_name, bucket_region)
+            object_inventory = get_object_inventory(s3_client, bucket_name)
+            if object_inventory.get("access_denied"):
+                entry["access_denied"] = True
+            else:
+                entry["storage_class"] = (
+                    next(iter(object_inventory["storage_class_breakdown"]))
+                    if len(object_inventory["storage_class_breakdown"]) == 1
+                    else "MULTIPLE"
+                )
+                entry.update({
+                    "size_bytes": object_inventory["size_bytes"],
+                    "size_mb": object_inventory["size_mb"],
+                    "size_gb": object_inventory["size_gb"],
+                    "size_human": object_inventory["size_human"],
+                    "object_count": object_inventory["object_count"],
+                    "newest_object_last_modified": object_inventory["newest_object_last_modified"],
+                    "oldest_object_last_modified": object_inventory["oldest_object_last_modified"],
+                })
+
+        if include_metrics:
+            logger.info(f"  {bucket_name} - done")
+
+        return entry
+    finally:
         try:
-            tagging = s3_client.get_bucket_tagging(Bucket=bucket_name)
-            entry["tags"] = {t["Key"]: t["Value"] for t in tagging.get("TagSet", [])}
+            s3_client.close()
         except Exception:
-            entry["tags"] = {}
-
-    if include_details:
-        object_inventory = get_object_inventory(s3_client, bucket_name)
-        if object_inventory.get("access_denied"):
-            entry["access_denied"] = True
-        else:
-            entry["storage_class"] = (
-                next(iter(object_inventory["storage_class_breakdown"]))
-                if len(object_inventory["storage_class_breakdown"]) == 1
-                else "MULTIPLE"
-            )
-            entry.update({
-                "size_bytes": object_inventory["size_bytes"],
-                "size_mb": object_inventory["size_mb"],
-                "size_gb": object_inventory["size_gb"],
-                "size_human": object_inventory["size_human"],
-                "object_count": object_inventory["object_count"],
-                "newest_object_last_modified": object_inventory["newest_object_last_modified"],
-                "oldest_object_last_modified": object_inventory["oldest_object_last_modified"],
-            })
-
-    if include_metrics:
-        logger.info(f"  {bucket_name} - done")
-
-    return entry
+            pass
 
 
 def scan_s3_buckets(session, include_metrics=False, name_filter=None, include_details=False, on_bucket_collected=None):
@@ -632,7 +732,7 @@ def scan_s3_buckets(session, include_metrics=False, name_filter=None, include_de
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {
                 executor.submit(
-                    _collect_single_bucket, session, s3_client, bucket, include_metrics, include_details
+                    _collect_single_bucket, session, bucket, include_metrics, include_details
                 ): bucket["Name"]
                 for bucket in filtered
             }
@@ -662,7 +762,15 @@ def main():
     parser = argparse.ArgumentParser(description="S3 Bucket Inventory Scanner")
     add_common_args(parser)
     parser.add_argument("--filter", "-f", help="Filter bucket names containing this string", default=None)
+    parser.add_argument("--metrics", action="store_true",
+                        help="Collect bucket size, request, config, replication, lifecycle, encryption metrics")
+    parser.add_argument("--details", action="store_true",
+                        help="Metrics plus per-object inventory (storage class, age, Storage Lens). Implies --metrics.")
     args = parser.parse_args()
+
+    # --details is a superset of --metrics. Default (neither flag) = fast bucket list.
+    include_details = args.details
+    include_metrics = args.metrics or args.details
 
     accounts = get_accounts(args.account)
     timestamp = get_timestamp()
@@ -683,6 +791,10 @@ def main():
         name = account["name"]
         account_id = account["account_id"]
         profile = account["profile"]
+
+        if account.get("enabled") is False:
+            logger.info(f"⏭️  {name} ({account_id}) — skipped (disabled)")
+            continue
 
         logger.info(f"🔍 {name} ({account_id}) — profile: {profile}")
 
@@ -708,9 +820,9 @@ def main():
         writer_lock = threading.Lock()
         buckets = scan_s3_buckets(
             session,
-            include_metrics=True,
+            include_metrics=include_metrics,
             name_filter=args.filter,
-            include_details=False,
+            include_details=include_details,
             on_bucket_collected=lambda entry: _flush_bucket(writer, entry, writer_lock),
         )
 
