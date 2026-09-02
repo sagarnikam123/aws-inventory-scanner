@@ -21,6 +21,7 @@ Usage:
 
 import sys
 import re
+import csv
 import json
 import glob
 import argparse
@@ -79,9 +80,14 @@ def find_latest_inventory(account_dir, service):
 def load_json(path):
     try:
         with open(path) as f:
-            return json.load(f)
-    except Exception:
+            data = json.load(f)
+    except Exception as error:
+        print(f"WARNING: could not load inventory {path}: {error}", file=sys.stderr)
         return None
+    if not isinstance(data, dict):
+        print(f"WARNING: ignoring inventory {path}: top-level JSON must be an object", file=sys.stderr)
+        return None
+    return data
 
 
 def parse_timestamp(ts):
@@ -90,7 +96,10 @@ def parse_timestamp(ts):
     if isinstance(ts, (int, float)):
         if ts > 1e12:
             ts = ts / 1000
-        return datetime.fromtimestamp(ts, tz=timezone.utc)
+        try:
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        except (OverflowError, OSError, TypeError, ValueError):
+            return None
     if isinstance(ts, str):
         # fromisoformat handles both 'T' and space separators, microseconds,
         # and colon tz offsets (+05:30) — covers most boto3 str timestamps.
@@ -109,6 +118,14 @@ def parse_timestamp(ts):
             except ValueError:
                 continue
     return None
+
+
+def _as_number(value, default=0):
+    """Normalize numeric inventory fields without aborting an account audit."""
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
 
 
 def is_stale(ts, days_threshold):
@@ -132,8 +149,103 @@ def days_until(ts):
     return (dt - datetime.now(timezone.utc)).days
 
 
-def finding(category, service, region, resource, issue, severity, est_monthly_cost=None):
-    """Create a standardized finding dict."""
+def _derive_default_action(category: str, service: str, issue: str) -> str:
+    """Intelligently suggest a concrete remediation action based on issue context."""
+    issue_lower = issue.lower()
+
+    if category == "security":
+        if "public ip" in issue_lower:
+            return "Remove public IP or migrate instance to private subnet behind ALB/NAT"
+        if "rotation" in issue_lower or service == "Secrets Manager":
+            return "Enable automatic secret rotation (30-90 days) or rotate credential immediately"
+        if "plaintext" in issue_lower or "securestring" in issue_lower or service == "SSM":
+            return "Delete plaintext parameter and recreate as SecureString encrypted with KMS"
+        if "unencrypted" in issue_lower or "encryption" in issue_lower:
+            return "Enable AWS KMS encryption at rest using a Customer Managed Key (CMK)"
+        if "public" in issue_lower:
+            return "Enable S3 Block Public Access / remove public resource policies"
+        if "mfa" in issue_lower:
+            return "Enforce MFA for user in IAM policy"
+        if "access key" in issue_lower or "stale" in issue_lower:
+            return "Deactivate and delete inactive/unused IAM access keys"
+        if "waf" in issue_lower:
+            return "Associate an AWS WAF WebACL to protect against Layer 7 exploits"
+        if "tls" in issue_lower:
+            return "Update TLS security policy to TLSv1.2 or higher"
+        return "Review IAM / resource policies and apply least-privilege configuration"
+
+    elif category == "cost":
+        if "eip" in issue_lower or service == "Elastic IP" or "unassociated" in issue_lower:
+            return "Release unassociated Elastic IP in VPC console (saves $3.65/mo per IP immediately)"
+        if "mwaa" in service.lower() or "airflow" in issue_lower:
+            return "Verify DAG activity and delete idle Airflow environment if unused (saves ~$360/mo each)"
+        if "elasticache" in service.lower() or "redis" in issue_lower:
+            return "Decommission old/unused ElastiCache cluster or right-size node type (saves ~$50/mo each)"
+        if "nat gateway" in service.lower() or "nat gateway" in issue_lower:
+            return "Consolidate into shared VPC NAT or replace with Gateway VPC Endpoints for S3/DynamoDB (saves $32/mo each)"
+        if "unattached" in issue_lower or "available" in issue_lower:
+            return "Snapshot if needed and delete unattached EBS volume (zero risk / instant savings)"
+        if "stopped" in issue_lower:
+            return "Terminate stopped EC2 instance or snapshot and delete attached EBS volumes"
+        if "idle" in issue_lower or "unused" in issue_lower or "0 items" in issue_lower or "0 tasks" in issue_lower:
+            return "Verify application necessity and decommission/delete idle resource"
+        if "overprovisioned" in issue_lower or "scale" in issue_lower or "scaled to zero" in issue_lower:
+            return "Downscale capacity or switch to On-Demand (PAY_PER_REQUEST) / auto-scaling"
+        if "lifecycle" in issue_lower or "s3" in service.lower():
+            return "Add S3 Lifecycle rule to transition old objects to Glacier / abort incomplete multipart uploads"
+        if "retention" in issue_lower or "log" in issue_lower:
+            return "Set CloudWatch log group retention policy (e.g. 14 to 90 days)"
+        return "Evaluate resource necessity and decommission or right-size"
+
+    elif category == "reliability":
+        if "single point of failure" in issue_lower or "multi-az" in issue_lower or "no ha" in issue_lower:
+            return "Enable Multi-AZ replication / multi-node cluster deployment for high availability"
+        if "deprecated" in issue_lower or "eol" in issue_lower:
+            return "Upgrade runtime/engine version to currently supported LTS release"
+        if "backup" in issue_lower or "recovery points" in issue_lower:
+            return "Assign AWS Backup plan with scheduled automated snapshots and retention"
+        if "deletion protection" in issue_lower:
+            return "Enable deletion protection in resource configuration"
+        if "alarm" in issue_lower or "insufficient_data" in issue_lower:
+            return "Update CloudWatch metric dimension or reconfigure alarm threshold"
+        return "Configure automated failover, health checks, and backup redundancy"
+
+    elif category == "drift":
+        if "disabled" in issue_lower:
+            return "Enable rule/automation or delete if no longer required"
+        if "not recording" in issue_lower:
+            return "Turn on AWS Config recorder for compliance monitoring"
+        if "untagged" in issue_lower:
+            return "Apply mandatory tagging (Environment, CostCenter, Owner)"
+        if "stale" in issue_lower or "no logging" in issue_lower:
+            return "Enable logging / update configuration to align with infrastructure baseline"
+        return "Align resource configuration with standard baseline"
+
+    return "Review and remediate according to best practices"
+
+
+def _derive_default_effort(category: str, service: str, issue: str) -> str:
+    """Categorize remediation effort: low (quick win), medium (validation), high (architectural)."""
+    issue_lower = issue.lower()
+
+    if any(k in issue_lower for k in [
+        "unattached", "unassociated", "disabled", "empty", "0 records",
+        "0 recovery points", "retention", "deletion protection", "untagged",
+        "no waf", "enforce config", "bytes_scanned", "eip", "elastic ip"
+    ]) or service in ["Elastic IP", "Route53", "Global Accelerator"]:
+        return "low"
+
+    if any(k in issue_lower for k in [
+        "multi-az", "single node", "engine version", "runtime", "single point of failure",
+        "migration", "cross-region"
+    ]):
+        return "high"
+
+    return "medium"
+
+
+def finding(category, service, region, resource, issue, severity, est_monthly_cost=None, action=None, effort=None):
+    """Create a standardized finding dict with remediation action and effort."""
     f = {
         "category": category,
         "service": service,
@@ -141,6 +253,8 @@ def finding(category, service, region, resource, issue, severity, est_monthly_co
         "resource": resource,
         "issue": issue,
         "severity": severity,
+        "action": action or _derive_default_action(category, service, issue),
+        "effort": effort or _derive_default_effort(category, service, issue),
     }
     if est_monthly_cost is not None:
         f["est_monthly_waste_usd"] = est_monthly_cost
@@ -208,7 +322,7 @@ def check_security_ec2_public_ips(account_dir, days_threshold):
 
 
 def check_security_rds(account_dir, days_threshold):
-    """RDS instances that are publicly accessible."""
+    """RDS instances and clusters that are publicly accessible or use expired CA certificates."""
     findings = []
     path = find_latest_inventory(account_dir, "rds")
     if not path:
@@ -221,12 +335,32 @@ def check_security_rds(account_dir, days_threshold):
         if not isinstance(region_data, dict):
             continue
         for inst in region_data.get("instances", []):
+            ident = inst.get("identifier", "unknown")
             if inst.get("publicly_accessible"):
                 findings.append(finding(
-                    "security", "RDS", region,
-                    inst.get("identifier", "unknown"),
+                    "security", "RDS", region, ident,
                     "Publicly accessible — database exposed to internet",
-                    "critical"
+                    "critical",
+                    action="Modify instance PubliclyAccessible setting to False and place in private subnets",
+                    effort="medium"
+                ))
+            ca_id = inst.get("ca_certificate_identifier", "")
+            if ca_id and "rds-ca-2019" in ca_id:
+                findings.append(finding(
+                    "security", "RDS", region, ident,
+                    f"Legacy CA certificate '{ca_id}' expired — database SSL/TLS connections at risk",
+                    "high",
+                    action="Modify RDS CA certificate to rds-ca-rsa2048-g1 or newer in AWS Console",
+                    effort="low"
+                ))
+        for cluster in region_data.get("clusters", []):
+            if cluster.get("publicly_accessible"):
+                findings.append(finding(
+                    "security", "RDS", region, cluster.get("identifier", "unknown"),
+                    "Cluster is publicly accessible — database exposed to internet",
+                    "critical",
+                    action="Disable public accessibility on DB cluster and update security groups",
+                    effort="medium"
                 ))
     return findings
 
@@ -597,9 +731,11 @@ def check_cost_sqs_dead(account_dir, days_threshold):
         if not isinstance(queues, list):
             continue
         for q in queues:
-            total_msgs = (q.get("approximate_messages", 0) +
-                         q.get("approximate_messages_delayed", 0) +
-                         q.get("approximate_messages_not_visible", 0))
+            total_msgs = (
+                _as_number(q.get("approximate_messages"))
+                + _as_number(q.get("approximate_messages_delayed"))
+                + _as_number(q.get("approximate_messages_not_visible"))
+            )
             if total_msgs == 0 and is_stale(q.get("last_modified_timestamp"), days_threshold):
                 age = days_ago(q.get("last_modified_timestamp"))
                 findings.append(finding(
@@ -716,9 +852,9 @@ def check_cost_dynamodb_overprovisioned(account_dir, days_threshold):
         if not isinstance(tables, list):
             continue
         for table in tables:
-            if table.get("billing_mode") == "PROVISIONED" and table.get("item_count", 0) == 0:
-                rcu = table.get("read_capacity", 0)
-                wcu = table.get("write_capacity", 0)
+            if table.get("billing_mode") == "PROVISIONED" and _as_number(table.get("item_count")) == 0:
+                rcu = _as_number(table.get("read_capacity"))
+                wcu = _as_number(table.get("write_capacity"))
                 # ponytail: rough cost — $0.00065/RCU/hr + $0.00065/WCU/hr
                 monthly = (rcu + wcu) * 0.00065 * 730
                 findings.append(finding(
@@ -780,7 +916,7 @@ def check_cost_ebs_waste(account_dir, days_threshold):
             continue
         # Unattached volumes
         for vol in region_data.get("unattached_volumes", []):
-            size = vol.get("size_gb", 0)
+            size = _as_number(vol.get("size_gb"))
             rate = ebs_rate(region, vol.get("volume_type", "gp3"))
             monthly = round(size * rate, 2)
             findings.append(finding(
@@ -891,7 +1027,7 @@ def check_cost_ecs_scaled_zero(account_dir, days_threshold):
 # ============================================================
 
 def check_reliability_rds(account_dir, days_threshold):
-    """RDS without Multi-AZ or backups."""
+    """RDS without Multi-AZ, backups, or deletion protection."""
     findings = []
     path = find_latest_inventory(account_dir, "rds")
     if not path:
@@ -904,12 +1040,40 @@ def check_reliability_rds(account_dir, days_threshold):
         if not isinstance(region_data, dict):
             continue
         for inst in region_data.get("instances", []):
+            ident = inst.get("identifier", "unknown")
             if not inst.get("multi_az", True):
                 findings.append(finding(
-                    "reliability", "RDS", region,
-                    inst.get("identifier", "unknown"),
+                    "reliability", "RDS", region, ident,
                     f"No Multi-AZ — single point of failure ({inst.get('instance_class', '?')})",
-                    "high"
+                    "high",
+                    action="Enable Multi-AZ deployment for high availability and failover",
+                    effort="medium"
+                ))
+            backup_retention_days = inst.get("backup_retention_days")
+            if backup_retention_days is not None and backup_retention_days <= 0:
+                findings.append(finding(
+                    "reliability", "RDS", region, ident,
+                    "Automated backups disabled — point-in-time recovery unavailable",
+                    "high",
+                    action="Enable automated backups with an appropriate retention period",
+                    effort="low"
+                ))
+            if inst.get("deletion_protection") is False:
+                findings.append(finding(
+                    "reliability", "RDS", region, ident,
+                    "Deletion protection disabled — risk of accidental database deletion",
+                    "medium",
+                    action="Enable deletion protection in DB instance configuration",
+                    effort="low"
+                ))
+        for cluster in region_data.get("clusters", []):
+            if cluster.get("deletion_protection") is False:
+                findings.append(finding(
+                    "reliability", "RDS", region, cluster.get("identifier", "unknown"),
+                    "Cluster deletion protection disabled — risk of accidental cluster deletion",
+                    "medium",
+                    action="Enable deletion protection in DB cluster configuration",
+                    effort="low"
                 ))
     return findings
 
@@ -1414,7 +1578,7 @@ def check_cost_emr_no_autoterminate(account_dir, days_threshold):
 
 
 def check_cost_s3_no_lifecycle(account_dir, days_threshold):
-    """S3 buckets with no lifecycle, retention > 1yr, or no Glacier transition."""
+    """S3 buckets with no lifecycle, missing multipart abort rules, retention > 1yr, or no Glacier transition."""
     findings = []
     path = find_latest_inventory(account_dir, "s3")
     if not path:
@@ -1426,28 +1590,38 @@ def check_cost_s3_no_lifecycle(account_dir, days_threshold):
     buckets = data.get("buckets", [])
     for bucket in buckets:
         lifecycle = bucket.get("lifecycle") or {}
-        size_gb = bucket.get("size_gb", 0)
+        size_gb = _as_number(bucket.get("size_gb"))
         name = bucket.get("bucket_name", bucket.get("name", "unknown"))
         region = bucket.get("region", "global")
 
-        # Skip only when we couldn't read lifecycle (error) — a missing/empty
-        # lifecycle is itself a finding (Check 1), so don't skip on falsy.
+        # Skip only when we couldn't read lifecycle (error)
         if lifecycle.get("error"):
             continue
 
         retention_configured = lifecycle.get("retention_configured", False)
         retention_days_list = lifecycle.get("retention_days") or []
         transitions = lifecycle.get("transitions", [])
+        abort_mp = lifecycle.get("abort_incomplete_multipart_days")
 
-        # Check 1: No lifecycle at all on a bucket > 10 GB
-        if not retention_configured and not transitions and size_gb > 10:
-            findings.append(finding(
-                "cost", "S3", region, name,
-                f"No lifecycle policy ({size_gb:.0f} GB) — storage grows indefinitely",
-                "low" if size_gb < 100 else "medium",
-                est_monthly_cost=round(size_gb * 0.023, 2)
-            ))
-            continue
+        # Check 1: No lifecycle at all
+        if not retention_configured and not transitions:
+            if size_gb > 10:
+                findings.append(finding(
+                    "cost", "S3", region, name,
+                    f"No lifecycle policy ({size_gb:.0f} GB) — storage grows indefinitely",
+                    "medium" if size_gb > 100 else "low",
+                    est_monthly_cost=round(size_gb * 0.023, 2),
+                    action="Add S3 Lifecycle rule to transition to Glacier or expire old objects",
+                    effort="low"
+                ))
+            else:
+                findings.append(finding(
+                    "drift", "S3", region, name,
+                    "No lifecycle policy configured — storage will grow indefinitely without retention or tiering rules",
+                    "info",
+                    action="Configure S3 Lifecycle policy with retention rules and tiering transitions",
+                    effort="low"
+                ))
 
         # Check 2: Retention > 365 days (keeping data > 1 year)
         long_retention = [d for d in retention_days_list if d > 365]
@@ -1457,6 +1631,8 @@ def check_cost_s3_no_lifecycle(account_dir, days_threshold):
                 "cost", "S3", region, name,
                 f"Retention {max_days} days (>{max_days // 365} yr) on {size_gb:.0f} GB — review if needed that long",
                 "low",
+                action="Review retention policy and transition data older than 90-180 days to Glacier",
+                effort="low"
             ))
 
         # Check 3: Has retention/lifecycle but no Glacier transition on large buckets
@@ -1466,7 +1642,20 @@ def check_cost_s3_no_lifecycle(account_dir, days_threshold):
                 "cost", "S3", region, name,
                 f"No Glacier/Deep Archive transition ({size_gb:.0f} GB) — tiering could save 60-80%",
                 "medium" if size_gb > 500 else "low",
-                est_monthly_cost=round(size_gb * 0.019, 2)  # savings vs staying in Standard
+                est_monthly_cost=round(size_gb * 0.019, 2),  # savings vs staying in Standard
+                action="Add S3 Lifecycle transition rule to Glacier Flexible or Deep Archive after 30-90 days",
+                effort="low"
+            ))
+
+        # Check 4: Missing AbortIncompleteMultipartUpload rule
+        if not abort_mp:
+            findings.append(finding(
+                "cost", "S3", region, name,
+                "Missing AbortIncompleteMultipartUpload rule — orphan multipart upload parts billed indefinitely",
+                "info" if size_gb == 0 else "low",
+                est_monthly_cost=0.50 if size_gb > 0 else 0.0,
+                action="Add S3 Lifecycle rule to abort incomplete multipart uploads after 7 days",
+                effort="low"
             ))
 
     return findings
@@ -2058,7 +2247,7 @@ def check_drift_rum_no_sampling(account_dir, days_threshold):
 
 
 def check_security_s3(account_dir, days_threshold):
-    """S3 buckets — check for unencrypted storage, replication gaps, and multipart upload waste."""
+    """S3 buckets — check encryption and replication gaps."""
     findings = []
     path = find_latest_inventory(account_dir, "s3")
     if not path:
@@ -2072,20 +2261,49 @@ def check_security_s3(account_dir, days_threshold):
         region = b.get("region", "global")
         lifecycle = b.get("lifecycle", {}) or {}
 
-        # 1. Incomplete multipart uploads not aborted (accumulates storage cost silently)
-        abort_days = lifecycle.get("abort_incomplete_multipart_days")
-        if abort_days is None:
-            findings.append(finding(
-                "cost", "S3", region, name,
-                "Incomplete multipart uploads not aborted — unfinished uploads bill indefinitely",
-                "low",
-                est_monthly_cost=5
-            ))
+        # Do not treat a failed lifecycle lookup as a missing security control.
+        if lifecycle.get("error"):
+            continue
 
-        # 2. Critical/production bucket replication checks
+        encryption = b.get("encryption")
+        if (
+            isinstance(encryption, dict)
+            and encryption.get("status") != "unavailable"
+            and not encryption.get("enabled", False)
+        ):
+            findings.append(finding(
+                "security", "S3", region, name,
+                "Bucket default encryption is not configured",
+                "medium",
+                action="Enable S3 server-side encryption with SSE-S3 or SSE-KMS",
+                effort="low"
+            ))
+        # Public Access Block check
+        pab = b.get("public_access_block")
+        if isinstance(pab, dict) and pab.get("status") != "unavailable":
+            if not pab.get("all_blocked", False) or pab.get("status") == "not_configured":
+                findings.append(finding(
+                    "security", "S3", region, name,
+                    "S3 Block Public Access is not fully enabled on bucket",
+                    "high",
+                    action="Enable S3 Block Public Access with all 4 settings active in S3 Console",
+                    effort="low"
+                ))
+
+        # Critical/production bucket replication and versioning checks
         tags = b.get("tags", {}) or {}
         env = str(tags.get("Environment", "")).lower()
         if "prod" in env or "production" in env:
+            versioning = b.get("versioning")
+            if isinstance(versioning, dict) and versioning.get("status") != "unavailable":
+                if not versioning.get("enabled", False):
+                    findings.append(finding(
+                        "reliability", "S3", region, name,
+                        "Production bucket has versioning disabled — risk of accidental object overwrite/loss",
+                        "medium",
+                        action="Enable bucket versioning in S3 bucket properties",
+                        effort="low"
+                    ))
             repl = b.get("replication", {}) or {}
             if not repl.get("enabled", False):
                 findings.append(finding(
@@ -2136,12 +2354,648 @@ def check_security_cloudfront(account_dir, days_threshold):
     return findings
 
 
+def check_security_ssm(account_dir, days_threshold):
+    """SSM Parameter Store — check for sensitive secrets stored as plaintext Strings instead of SecureString."""
+    findings = []
+    path = find_latest_inventory(account_dir, "ssm")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    sensitive_keywords = ["password", "secret", "rsa_key", "token", "key.p8", "credentials", "auth_key", "api_key", "private_key", "passwd", "cert.pem"]
+    for region, params in data.get("regions", {}).items():
+        if not isinstance(params, list):
+            continue
+        for p in params:
+            name = p.get("name", "")
+            p_type = p.get("type", "")
+            if p_type in ("String", "StringList"):
+                name_lower = name.lower()
+                if any(kw in name_lower for kw in sensitive_keywords):
+                    findings.append(finding(
+                        "security", "SSM", region, name,
+                        f"Plaintext parameter ({p_type}) matches sensitive naming pattern — should be SecureString encrypted with KMS",
+                        "high",
+                        action="Delete plaintext parameter and recreate as SecureString encrypted with KMS",
+                        effort="low"
+                    ))
+    return findings
+
+
+def check_security_athena(account_dir, days_threshold):
+    """Athena workgroups — check for unenforced configuration and missing scan limits."""
+    findings = []
+    path = find_latest_inventory(account_dir, "athena")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, workgroups in data.get("regions", {}).items():
+        if not isinstance(workgroups, list):
+            continue
+        for wg in workgroups:
+            name = wg.get("name", "unknown")
+            state = wg.get("state", "ENABLED")
+            if state != "ENABLED":
+                continue
+            enforce = wg.get("enforce_config", True)
+            if not enforce:
+                findings.append(finding(
+                    "security", "Athena", region, f"workgroup/{name}",
+                    "Workgroup does not enforce configuration — users can override encryption & output location",
+                    "medium",
+                    action="Enable 'Enforce workgroup configuration' in Athena settings",
+                    effort="low"
+                ))
+            cutoff = wg.get("bytes_scanned_cutoff", 0)
+            if cutoff == 0:
+                findings.append(finding(
+                    "cost", "Athena", region, f"workgroup/{name}",
+                    "No query data scan limit configured — vulnerable to runaway scan costs",
+                    "low",
+                    action="Configure per-query data scan limit (e.g. 10 GB) to prevent expensive queries",
+                    effort="low"
+                ))
+    return findings
+
+
+def check_security_ses(account_dir, days_threshold):
+    """SES — check for failed identity verifications and disabled sending."""
+    findings = []
+    path = find_latest_inventory(account_dir, "ses")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, reg_data in data.get("regions", {}).items():
+        if not isinstance(reg_data, dict):
+            continue
+        for identity in reg_data.get("identities", []):
+            name = identity.get("identity_name", "unknown")
+            status = identity.get("verification_status", "UNKNOWN")
+            sending = identity.get("sending_enabled", True)
+            if status == "FAILED":
+                findings.append(finding(
+                    "drift", "SES", region, name,
+                    "SES identity verification status is FAILED — broken email identity",
+                    "low",
+                    action="Re-verify DNS TXT/CNAME records or delete unused SES identity",
+                    effort="low"
+                ))
+            elif not sending:
+                findings.append(finding(
+                    "drift", "SES", region, name,
+                    "SES identity has sending disabled — inactive email identity",
+                    "info",
+                    action="Enable sending or remove obsolete SES identity",
+                    effort="low"
+                ))
+    return findings
+
+
+def check_cost_route53(account_dir, days_threshold):
+    """Route53 — empty hosted zones costing $0.50/month each."""
+    findings = []
+    path = find_latest_inventory(account_dir, "route53")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for zone in data.get("hosted_zones", []):
+        zone_id = zone.get("zone_id", "unknown")
+        name = zone.get("name", "unknown")
+        record_count = zone.get("record_count", 0)
+        # Empty zone has only standard NS + SOA records (<= 2)
+        if record_count <= 2:
+            findings.append(finding(
+                "cost", "Route53", "global", f"{name} ({zone_id})",
+                f"Empty hosted zone ({record_count} records) — costing $0.50/mo",
+                "info",
+                est_monthly_cost=0.50,
+                action="Delete empty Route 53 hosted zone if obsolete",
+                effort="low"
+            ))
+    return findings
+
+
+def check_cost_network_firewall(account_dir, days_threshold):
+    """Network Firewall — high hourly endpoint costs ($0.395/hr = ~$285/mo per AZ endpoint)."""
+    findings = []
+    path = find_latest_inventory(account_dir, "network-firewall")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if not isinstance(region_data, dict):
+            continue
+        for fw in region_data.get("firewalls", []):
+            name = fw.get("firewall_name") or fw.get("name", "unknown")
+            endpoints = fw.get("sync_states", {}) or fw.get("endpoints", [])
+            ep_count = len(endpoints) if isinstance(endpoints, (dict, list)) else 1
+            est_cost = max(ep_count, 1) * 285.0
+            findings.append(finding(
+                "cost", "Network Firewall", region, name,
+                f"Network Firewall active with {ep_count} endpoint(s) (~${est_cost:,.0f}/mo) — verify traffic requirement",
+                "medium",
+                est_monthly_cost=est_cost,
+                action="Review Network Firewall endpoints and delete unused VPC attachments",
+                effort="medium"
+            ))
+    return findings
+
+
+def check_cost_globalaccelerator(account_dir, days_threshold):
+    """Global Accelerator — $18/mo fixed fee per accelerator."""
+    findings = []
+    path = find_latest_inventory(account_dir, "globalaccelerator")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for acc in data.get("accelerators", []):
+        name = acc.get("name", "unknown")
+        enabled = acc.get("enabled", True)
+        listeners = acc.get("listeners", []) or acc.get("listener_count", 0)
+        num_listeners = len(listeners) if isinstance(listeners, list) else listeners
+        if not enabled or num_listeners == 0:
+            status_desc = "disabled" if not enabled else "0 active listeners"
+            findings.append(finding(
+                "cost", "Global Accelerator", "global", name,
+                f"Global Accelerator {status_desc} (~$18/mo fixed fee) — wasting cost",
+                "medium",
+                est_monthly_cost=18.0,
+                action="Delete unused Global Accelerator to save $18/mo",
+                effort="low"
+            ))
+    return findings
+
+
+def check_cost_timestream(account_dir, days_threshold):
+    """Timestream — high memory retention store (~860x price difference vs magnetic)."""
+    findings = []
+    path = find_latest_inventory(account_dir, "timestream")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, dbs in data.get("regions", {}).items():
+        if not isinstance(dbs, list):
+            continue
+        for db in dbs:
+            db_name = db.get("database_name", "unknown")
+            tables = db.get("tables", [])
+            for tbl in tables:
+                tbl_name = tbl.get("table_name", "unknown")
+                mem_hours = tbl.get("memory_retention_hours", 0)
+                if mem_hours > 24:
+                    findings.append(finding(
+                        "cost", "Timestream", region, f"{db_name}/{tbl_name}",
+                        f"High memory store retention ({mem_hours}h) — memory tier is ~$0.036/GB-hr vs magnetic tier ~$0.03/GB-mo",
+                        "medium",
+                        action="Reduce memory retention to 2-6 hours and query magnetic storage tier for historical data",
+                        effort="low"
+                    ))
+    return findings
+
+
+def check_drift_api_gateway_stale(account_dir, days_threshold):
+    """API Gateway — stale test, demo, or hackathon APIs."""
+    findings = []
+    path = find_latest_inventory(account_dir, "api-gateway")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, reg_data in data.get("regions", {}).items():
+        if not isinstance(reg_data, dict):
+            continue
+        all_apis = reg_data.get("rest_apis", []) + reg_data.get("http_apis", [])
+        for api in all_apis:
+            name = api.get("name", "unknown")
+            api_id = api.get("api_id", "unknown")
+            created = api.get("created_date")
+            name_lower = name.lower()
+            if any(k in name_lower for k in ["test", "demo", "hackathon", "sample", "temp"]) and is_stale(created, days_threshold):
+                d_ago = days_ago(created)
+                findings.append(finding(
+                    "drift", "API Gateway", region, f"{name} ({api_id})",
+                    f"Test/demo API created {d_ago}d ago — likely obsolete endpoint",
+                    "low",
+                    action="Review API usage in CloudWatch and delete obsolete test API",
+                    effort="low"
+                ))
+    return findings
+
+
+def check_cost_quicksight(account_dir, days_threshold):
+    """QuickSight — orphaned datasets with no dashboard associations."""
+    findings = []
+    path = find_latest_inventory(account_dir, "quicksight")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, reg_data in data.get("regions", {}).items():
+        if not isinstance(reg_data, dict):
+            continue
+        dashboards = reg_data.get("dashboards", [])
+        datasets = reg_data.get("datasets", [])
+        if datasets and len(dashboards) == 0:
+            for ds in datasets:
+                name = ds.get("name", "unknown")
+                created = ds.get("created_time")
+                if is_stale(created, days_threshold):
+                    findings.append(finding(
+                        "cost", "QuickSight", region, name,
+                        f"QuickSight dataset with 0 active dashboards (created {days_ago(created)}d ago)",
+                        "info",
+                        action="Delete unused QuickSight dataset to free SPICE storage",
+                        effort="low"
+                    ))
+    return findings
+
+
+def check_cost_apprunner(account_dir, days_threshold):
+    """AppRunner — paused or idle services."""
+    findings = []
+    path = find_latest_inventory(account_dir, "apprunner")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, services in data.get("regions", {}).items():
+        if not isinstance(services, list):
+            continue
+        for svc in services:
+            name = svc.get("service_name", "unknown")
+            status = svc.get("status", "UNKNOWN")
+            if status == "PAUSED":
+                findings.append(finding(
+                    "cost", "AppRunner", region, name,
+                    "AppRunner service is PAUSED — provisioned resources may incur memory retention fees",
+                    "low",
+                    action="Delete paused AppRunner service if not resuming",
+                    effort="low"
+                ))
+    return findings
+
+
+def check_cost_fsx(account_dir, days_threshold):
+    """FSx — single-AZ file systems in production without high availability."""
+    findings = []
+    path = find_latest_inventory(account_dir, "fsx")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, fs_list in data.get("regions", {}).items():
+        if not isinstance(fs_list, list):
+            continue
+        for fs in fs_list:
+            fs_id = fs.get("file_system_id", "unknown")
+            fs_type = fs.get("file_system_type", "unknown")
+            # Only flag when deployment type is known to be single-AZ; a missing
+            # field means the collector didn't capture it — don't assume single-AZ.
+            dep_type = fs.get("deployment_type", "")
+            if dep_type.startswith("SINGLE_AZ"):
+                findings.append(finding(
+                    "reliability", "FSx", region, f"{fs_id} ({fs_type})",
+                    f"Single-AZ deployment ({dep_type}) — no automatic failover for storage",
+                    "medium",
+                    action="Migrate to Multi-AZ FSx file system for production data durability",
+                    effort="high"
+                ))
+    return findings
+
+
+def check_reliability_direct_connect(account_dir, days_threshold):
+    """Direct Connect — degraded or down dedicated connections."""
+    findings = []
+    path = find_latest_inventory(account_dir, "direct-connect")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if not isinstance(region_data, dict):
+            continue
+        for c in region_data.get("connections", []):
+            name = c.get("connection_name") or c.get("name", "unknown")
+            state = (c.get("state") or c.get("connection_state") or "").lower()
+            if state in ("down", "deleted", "rejected"):
+                findings.append(finding(
+                    "reliability", "Direct Connect", region, name,
+                    f"Direct Connect link state is '{state}' — dedicated hybrid link disrupted",
+                    "high",
+                    action="Investigate circuit status with telecom provider and AWS Direct Connect console",
+                    effort="medium"
+                ))
+    return findings
+
+
+def check_cost_ebs_gp2_upgrade(account_dir, days_threshold):
+    """EBS gp2 volumes that can be upgraded to gp3 for 20% cost savings and better baseline performance."""
+    findings = []
+    path = find_latest_inventory(account_dir, "ebs")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if not isinstance(region_data, dict):
+            continue
+        for vol in region_data.get("volumes", []):
+            # Skip unattached volumes — check_cost_ebs_waste already flags them
+            # as pure waste; counting a gp2 upgrade too would double-count savings.
+            if vol.get("attached") is False:
+                continue
+            if vol.get("volume_type") == "gp2":
+                size_gb = vol.get("size_gb", 0)
+                # gp2 is $0.10/GB, gp3 is $0.08/GB -> savings is $0.02/GB-mo
+                savings = round(size_gb * 0.02, 2)
+                vol_id = vol.get("volume_id", "unknown")
+                vol_name = vol.get("name") or vol_id
+                findings.append(finding(
+                    "cost", "EBS", region,
+                    f"{vol_id} ({vol_name})",
+                    f"Legacy gp2 volume ({size_gb} GB) — upgrade to gp3 for 20% savings + 3,000 IOPS / 125 MB/s baseline",
+                    "medium" if savings > 10 else "low",
+                    est_monthly_cost=savings,
+                    action="Modify volume type from gp2 to gp3 in EC2 console or IaC (zero downtime, saves $0.02/GB/mo)",
+                    effort="low"
+                ))
+    return findings
+
+
+def check_security_amg_stale_permissions(account_dir, days_threshold):
+    """Managed Grafana (AMG) workspaces with stale users holding active permissions/licenses."""
+    findings = []
+    path = find_latest_inventory(account_dir, "amg-permissions")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    workspaces = data.get("workspaces", {})
+    if isinstance(workspaces, dict):
+        for ws_id, ws_info in workspaces.items():
+            if not isinstance(ws_info, dict):
+                continue
+            ws_name = ws_info.get("workspace_name", ws_id)
+            region = ws_info.get("region", "global")
+            summary = ws_info.get("summary", {})
+            stale_count = summary.get("stale_users", 0)
+            if stale_count > 0:
+                findings.append(finding(
+                    "security", "AMG", region,
+                    f"{ws_name} ({ws_id})",
+                    f"{stale_count} stale/orphaned users with active permissions — offboarding risk & wasted licenses",
+                    "high" if stale_count > 5 else "medium",
+                    action="Revoke AMG workspace role assignments for stale/offboarded users in IAM Identity Center",
+                    effort="low"
+                ))
+    return findings
+
+
+def check_security_sqs_unencrypted(account_dir, days_threshold):
+    """SQS queues missing server-side encryption (SSE-SQS or AWS KMS)."""
+    findings = []
+    path = find_latest_inventory(account_dir, "sqs")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if isinstance(region_data, list):
+            queues = region_data
+        elif isinstance(region_data, dict):
+            queues = region_data.get("queues", [])
+        else:
+            queues = []
+        for q in queues:
+            # Skip queues whose attributes could not be read — empty defaults
+            # would otherwise look like a real unencrypted config.
+            if q.get("attributes_available") is False:
+                continue
+            q_name = q.get("queue_name", q.get("name", "unknown"))
+            is_encrypted = bool(
+                q.get("kms_key_id")
+                or q.get("kms_master_key_id")
+                or q.get("sqs_managed_sse_enabled")
+            )
+            # Older inventories predate the SSE-SQS field; encryption state is unknown.
+            if "sqs_managed_sse_enabled" not in q and not q.get("kms_key_id"):
+                continue
+            if not is_encrypted:
+                findings.append(finding(
+                    "security", "SQS", region, q_name,
+                    "Queue unencrypted at rest — missing SSE-SQS / AWS KMS key",
+                    "medium",
+                    action="Enable SQS-managed server-side encryption (SSE-SQS) or Customer Managed Key (CMK)",
+                    effort="low"
+                ))
+    return findings
+
+
+def check_reliability_sqs_dlq(account_dir, days_threshold):
+    """SQS queues without a Dead Letter Queue (DLQ) redrive policy."""
+    findings = []
+    path = find_latest_inventory(account_dir, "sqs")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if isinstance(region_data, list):
+            queues = region_data
+        elif isinstance(region_data, dict):
+            queues = region_data.get("queues", [])
+        else:
+            queues = []
+        for q in queues:
+            if q.get("attributes_available") is False:
+                continue
+            q_name = q.get("queue_name", q.get("name", "unknown"))
+            if "dlq" in q_name.lower() or "deadletter" in q_name.lower():
+                continue
+            has_dlq = bool(q.get("redrive_policy"))
+            if not has_dlq:
+                findings.append(finding(
+                    "reliability", "SQS", region, q_name,
+                    "No Dead Letter Queue (DLQ) configured — poisoned messages may be lost or loop indefinitely",
+                    "medium",
+                    action="Configure redrive policy with maxReceiveCount and a designated Dead Letter Queue",
+                    effort="medium"
+                ))
+    return findings
+
+
+def check_security_sns_unencrypted(account_dir, days_threshold):
+    """SNS topics missing AWS KMS server-side encryption."""
+    findings = []
+    path = find_latest_inventory(account_dir, "sns")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if not isinstance(region_data, dict):
+            continue
+        for topic in region_data.get("topics", []):
+            t_name = topic.get("name", topic.get("topic_name", topic.get("topic_arn", topic.get("arn", "unknown")).split(":")[-1]))
+            is_encrypted = bool(topic.get("kms_key_id") or topic.get("kms_master_key_id"))
+            if not is_encrypted:
+                findings.append(finding(
+                    "security", "SNS", region, t_name,
+                    "Topic unencrypted at rest — missing AWS KMS encryption key",
+                    "medium",
+                    action="Enable AWS KMS encryption using alias/aws/sns or a Customer Managed Key (CMK)",
+                    effort="low"
+                ))
+    return findings
+
+
+def check_cost_lambda_graviton(account_dir, days_threshold):
+    """Lambda functions running on x86_64 architecture that can switch to arm64 (Graviton2) for 20% cost savings."""
+    findings = []
+    path = find_latest_inventory(account_dir, "lambda")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        fn_list = region_data if isinstance(region_data, list) else region_data.get("functions", [])
+        for fn in fn_list:
+            fn_name = fn.get("name", fn.get("function_name", "unknown"))
+            arch = fn.get("architectures", ["x86_64"])
+            runtime = fn.get("runtime", "")
+            is_graviton_ready = any(r in runtime.lower() for r in ["python", "nodejs", "java", "dotnet", "ruby", "provided"])
+            if "arm64" not in arch and is_graviton_ready:
+                findings.append(finding(
+                    "cost", "Lambda", region, fn_name,
+                    f"Running on x86_64 ({runtime}) — switch to arm64 (Graviton2) for 20% lower cost and better performance",
+                    "low",
+                    action="Change function architecture from x86_64 to arm64 in Lambda configuration",
+                    effort="low"
+                ))
+    return findings
+
+
+def check_security_cloudtrail_inactive(account_dir, days_threshold):
+    """CloudTrail trails with logging turned OFF or missing KMS / CloudWatch Logs integration."""
+    findings = []
+    path = find_latest_inventory(account_dir, "cloudtrail")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, region_data in data.get("regions", {}).items():
+        if not isinstance(region_data, dict):
+            continue
+        for trail in region_data.get("trails", []):
+            t_name = trail.get("name", "unknown")
+            if not trail.get("kms_key_id"):
+                findings.append(finding(
+                    "security", "CloudTrail", region, t_name,
+                    "CloudTrail log files not encrypted with Customer Managed Key (CMK)",
+                    "low",
+                    action="Enable AWS KMS CMK encryption for CloudTrail trail log files",
+                    effort="low"
+                ))
+            if not trail.get("cloudwatch_logs_arn"):
+                findings.append(finding(
+                    "security", "CloudTrail", region, t_name,
+                    "CloudTrail not integrated with CloudWatch Logs — real-time alerting disabled",
+                    "low",
+                    action="Configure CloudTrail to deliver logs to a CloudWatch Logs log group",
+                    effort="low"
+                ))
+    return findings
+
+
+def check_security_eks(account_dir, days_threshold):
+    """EKS clusters with public API server endpoints or missing KMS secrets envelope encryption."""
+    findings = []
+    path = find_latest_inventory(account_dir, "eks")
+    if not path:
+        return findings
+    data = load_json(path)
+    if not data:
+        return findings
+
+    for region, clusters in data.get("regions", {}).items():
+        if not isinstance(clusters, list):
+            continue
+        for cluster in clusters:
+            c_name = cluster.get("name", "unknown")
+            vpc_cfg = cluster.get("vpc_config", {})
+            if vpc_cfg.get("endpoint_public"):
+                cidrs = vpc_cfg.get("public_access_cidrs", [])
+                if not cidrs or "0.0.0.0/0" in cidrs:
+                    findings.append(finding(
+                        "security", "EKS", region, c_name,
+                        "Kubernetes API server endpoint is public and open to 0.0.0.0/0 — exposed to internet",
+                        "medium",
+                        action="Restrict publicAccessCidrs in EKS cluster VPC config or disable public endpoint",
+                        effort="low"
+                    ))
+            encryption = cluster.get("encryption", {})
+            if encryption and not encryption.get("has_secrets_encryption", True):
+                findings.append(finding(
+                    "security", "EKS", region, c_name,
+                    "Kubernetes Secrets KMS envelope encryption is disabled",
+                    "low",
+                    action="Enable AWS KMS envelope encryption for Kubernetes secrets in EKS cluster",
+                    effort="medium"
+                ))
+    return findings
+
+
 ALL_CHECKS = [
     # Security
     check_security_ec2_public_ips,
     check_security_rds,
     check_security_redshift,
     check_security_cloudtrail,
+    check_security_cloudtrail_inactive,
     check_security_kms,
     check_security_secrets,
     check_security_iam,
@@ -2149,10 +3003,17 @@ ALL_CHECKS = [
     check_security_inspector,
     check_security_hub,
     check_security_amg_auth,
+    check_security_amg_stale_permissions,
     check_security_documentdb,
     check_security_workspaces_unencrypted,
     check_security_cloudfront,
     check_security_s3,
+    check_security_eks,
+    check_security_ssm,
+    check_security_athena,
+    check_security_sqs_unencrypted,
+    check_security_sns_unencrypted,
+    check_security_ses,
     # Cost
     check_cost_ec2_stopped,
     check_cost_nat_gateways,
@@ -2160,11 +3021,13 @@ ALL_CHECKS = [
     check_cost_sns_unused,
     check_cost_sqs_dead,
     check_cost_lambda_stale,
+    check_cost_lambda_graviton,
     check_cost_efs_empty,
     check_cost_ecr_empty,
     check_cost_dynamodb_overprovisioned,
     check_cost_elb_idle,
     check_cost_ebs_waste,
+    check_cost_ebs_gp2_upgrade,
     check_cost_kinesis,
     check_cost_acm_unused,
     check_cost_ecs_scaled_zero,
@@ -2184,6 +3047,13 @@ ALL_CHECKS = [
     check_cost_amplify_stale,
     check_cost_cloudwatch_log_retention,
     check_cost_xray_full_sampling,
+    check_cost_route53,
+    check_cost_network_firewall,
+    check_cost_globalaccelerator,
+    check_cost_timestream,
+    check_cost_quicksight,
+    check_cost_apprunner,
+    check_cost_fsx,
     # Reliability
     check_reliability_rds,
     check_reliability_eks_version,
@@ -2192,12 +3062,14 @@ ALL_CHECKS = [
     check_reliability_ecs_failing,
     check_reliability_dynamodb_no_protection,
     check_reliability_backup_empty,
-    check_reliability_security_lake,  # also emits security + cost + drift findings
+    check_reliability_security_lake,
     check_reliability_workspaces_unhealthy,
     check_reliability_synthetics,
     check_reliability_amp_status,
     check_reliability_internet_monitor,
     check_reliability_health_events,
+    check_reliability_direct_connect,
+    check_reliability_sqs_dlq,
     # Drift / Hygiene
     check_drift_rum_no_sampling,
     check_drift_untagged_ec2,
@@ -2206,6 +3078,7 @@ ALL_CHECKS = [
     check_drift_cloudwatch_alarms,
     check_drift_step_functions_no_logging,
     check_drift_cloudtrail_stale,
+    check_drift_api_gateway_stale,
 ]
 
 
@@ -2262,8 +3135,34 @@ def resolve_target_account(account_arg=None, profile_arg=None):
         sys.exit(1)
 
 
+def generate_csv_report(output_data: dict, output_path: Path):
+    """Generate a CSV report of all findings for spreadsheets / Jira import."""
+    account_id = output_data.get("account_id")
+    findings = output_data.get("findings", [])
+    fieldnames = [
+        "account_id", "severity", "category", "service", "region",
+        "resource", "issue", "est_monthly_waste_usd", "action", "effort"
+    ]
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in findings:
+            writer.writerow({
+                "account_id": account_id,
+                "severity": item.get("severity", ""),
+                "category": item.get("category", ""),
+                "service": item.get("service", ""),
+                "region": item.get("region", ""),
+                "resource": item.get("resource", ""),
+                "issue": item.get("issue", ""),
+                "est_monthly_waste_usd": item.get("est_monthly_waste_usd", 0.0),
+                "action": item.get("action", ""),
+                "effort": item.get("effort", "medium"),
+            })
+
+
 def generate_markdown_report(output_data: dict, output_path: Path):
-    """Generate a clean GitHub/Notion flavored Markdown summary."""
+    """Generate a clean GitHub/Notion flavored Markdown summary with Table of Contents, Quick Wins, and Action Playbook."""
     account_id = output_data.get("account_id")
     total_findings = output_data.get("total_findings", 0)
     waste = output_data.get("estimated_monthly_waste_usd", 0)
@@ -2271,47 +3170,128 @@ def generate_markdown_report(output_data: dict, output_path: Path):
     cat_counts = output_data.get("findings_by_category", {})
     top_costs = output_data.get("top_cost_savings", [])
     findings = output_data.get("findings", [])
+    service_waste = output_data.get("service_waste_breakdown", [])
+
+    critical_high = [f for f in findings if f.get("severity") in ("critical", "high")]
+    quick_wins = output_data.get("quick_wins", [])[:15]
+    quick_win_savings = sum(f.get("est_monthly_waste_usd", 0) for f in quick_wins)
+
+    toc_links = [
+        "- [📊 Executive Summary & Decision Matrix](#executive-summary)",
+    ]
+    if quick_wins:
+        toc_links.append(f"- [🚀 Immediate Quick Wins (Save ${quick_win_savings:,.0f}/mo)](#quick-wins)")
+    if top_costs:
+        toc_links.append("- [💡 Top Cost Reduction Opportunities](#top-cost-reduction-opportunities)")
+    if service_waste:
+        toc_links.append("- [📈 Service Waste Breakdown](#service-waste-breakdown)")
+    if critical_high:
+        toc_links.append(f"- [🔴 Critical & High Findings Checklist ({len(critical_high)})](#critical--high-findings-checklist)")
+    toc_links.append("- [📋 3-Phase Action Playbook](#action-playbook)")
 
     lines = [
         f"# AWS Resource Audit Report — Account `{account_id}`",
         f"\n**Generated**: `{output_data.get('generated')}` | **Staleness Threshold**: `{output_data.get('staleness_threshold_days')} days`\n",
-        "## 📊 Executive Summary\n",
-        "| Metric | Value |",
-        "| :--- | :--- |",
-        f"| **Account ID** | `{account_id}` |",
-        f"| **Total Findings** | **{total_findings}** |",
-        f"| **Est. Monthly Waste** | **${waste:,.2f} / mo** (${waste * 12:,.2f}/yr) |",
-        f"| **Severity Breakdown** | 🔴 `{sev_counts.get('critical', 0)} Critical` | 🟠 `{sev_counts.get('high', 0)} High` | 🟡 `{sev_counts.get('medium', 0)} Medium` | 🔵 `{sev_counts.get('low', 0)} Low` | ⚪ `{sev_counts.get('info', 0)} Info` |",
-        f"| **Category Breakdown** | 🔒 `{cat_counts.get('security', 0)} Security` | 💰 `{cat_counts.get('cost', 0)} Cost` | ⚙️ `{cat_counts.get('reliability', 0)} Reliability` | 🧹 `{cat_counts.get('drift', 0)} Drift` |\n",
+        "## 📑 Table of Contents\n",
+        "\n".join(toc_links),
+        "\n---\n",
+        '<a id="executive-summary"></a>',
+        "## 📊 Executive Summary & Decision Matrix\n",
+        "| Metric | Value | Action Priority |",
+        "| :--- | :--- | :--- |",
+        f"| **Account ID** | `{account_id}` | Reference |",
+        f"| **Total Findings** | **{total_findings}** | Overall backlog |",
+        f"| **Est. Monthly Waste** | **${waste:,.2f} / mo** (${waste * 12:,.2f}/yr) | 💰 High Financial ROI |",
+        f"| **Instant Quick Wins** | **${quick_win_savings:,.2f} / mo** (${quick_win_savings * 12:,.2f}/yr) | 🟢 Zero Downtime Actions |",
+        f"| **Severity Breakdown** | 🔴 `{sev_counts.get('critical', 0)} Critical` \\| 🟠 `{sev_counts.get('high', 0)} High` \\| 🟡 `{sev_counts.get('medium', 0)} Medium` \\| 🔵 `{sev_counts.get('low', 0)} Low` \\| ⚪ `{sev_counts.get('info', 0)} Info` | 🔴 Fix Critical immediately |",
+        f"| **Category Breakdown** | 🔒 `{cat_counts.get('security', 0)} Security` \\| 💰 `{cat_counts.get('cost', 0)} Cost` \\| ⚙️ `{cat_counts.get('reliability', 0)} Reliability` \\| 🧹 `{cat_counts.get('drift', 0)} Drift` | Cross-functional allocation |\n",
     ]
+
+    if quick_wins:
+        lines.extend([
+            '<a id="quick-wins"></a>',
+            f"## 🚀 Immediate Quick Wins (Est. Savings: ${quick_win_savings:,.2f}/mo)\n",
+            "> [!TIP]",
+            "> These findings have **Low Effort / Zero Downtime Risk** and can be safely cleaned up immediately for instant billing reduction.\n",
+            "| Est. Savings | Service | Resource | Issue | Action & Remediation |",
+            "| :--- | :--- | :--- | :--- | :--- |",
+        ])
+        for f in quick_wins:
+            lines.append(f"| **${f.get('est_monthly_waste_usd', 0):,.0f}/mo** | `{f.get('service')}` | `{f.get('resource')}` | {f.get('issue')} | **{f.get('action')}** |")
+        lines.append("")
 
     if top_costs:
         lines.extend([
+            '<a id="top-cost-reduction-opportunities"></a>',
             "## 💡 Top Cost Reduction Opportunities\n",
-            "| Est. Waste | Service | Resource | Issue |",
-            "| :--- | :--- | :--- | :--- |",
+            "| Est. Waste | Service | Resource | Issue | Recommended Action | Effort |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- |",
         ])
         for f in top_costs[:15]:
-            lines.append(f"| **${f.get('est_monthly_waste_usd', 0):,.0f}/mo** | `{f.get('service')}` | `{f.get('resource')}` | {f.get('issue')} |")
+            effort_badge = "🟢 `LOW`" if f.get("effort") == "low" else ("🟡 `MEDIUM`" if f.get("effort") == "medium" else "🔴 `HIGH`")
+            lines.append(f"| **${f.get('est_monthly_waste_usd', 0):,.0f}/mo** | `{f.get('service')}` | `{f.get('resource')}` | {f.get('issue')} | {f.get('action')} | {effort_badge} |")
         lines.append("")
 
-    critical_high = [f for f in findings if f.get("severity") in ("critical", "high")]
+    if service_waste:
+        lines.extend([
+            '<a id="service-waste-breakdown"></a>',
+            "## 📈 Service Waste Breakdown\n",
+            "| Service | Findings Count | Est. Monthly Waste | Est. Annual Waste | Share of Total Waste |",
+            "| :--- | :--- | :--- | :--- | :--- |",
+        ])
+        for sw in service_waste[:10]:
+            share = (sw['waste_monthly'] / waste * 100) if waste > 0 else 0
+            lines.append(f"| `{sw['service']}` | {sw['count']} | **${sw['waste_monthly']:,.2f}/mo** | ${sw['waste_annual']:,.2f}/yr | {share:.1f}% |")
+        lines.append("")
+
     if critical_high:
         lines.extend([
+            '<a id="critical--high-findings-checklist"></a>',
             "## 🔴 Critical & High Findings Checklist\n",
-            "| Severity | Category | Service | Region | Resource | Issue |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- |",
+            "| Severity | Category | Service | Region | Resource | Issue | Action & Remediation |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
         ])
         for f in critical_high:
             sev_badge = "🔴 `CRITICAL`" if f.get("severity") == "critical" else "🟠 `HIGH`"
-            lines.append(f"| {sev_badge} | {f.get('category').capitalize()} | `{f.get('service')}` | `{f.get('region')}` | `{f.get('resource')}` | {f.get('issue')} |")
+            lines.append(f"| {sev_badge} | {f.get('category').capitalize()} | `{f.get('service')}` | `{f.get('region')}` | `{f.get('resource')}` | {f.get('issue')} | {f.get('action')} |")
         lines.append("")
+
+    critical_count = sum(1 for f in findings if f.get("severity") == "critical")
+    high_count = sum(1 for f in findings if f.get("severity") == "high")
+    stopped_ec2 = sum(1 for f in findings if f.get("service") == "EC2" and "Stopped" in f.get("issue", ""))
+
+    lines.extend([
+        '<a id="action-playbook"></a>',
+        "## 📋 3-Phase Action Playbook\n",
+        "### 🟢 Phase 1: Immediate Actions (Today)",
+    ])
+    if quick_wins:
+        lines.append(f"- [ ] 💰 **Execute Quick Wins**: Clean up unattached EBS, unused IPs, empty zones (Est. **${quick_win_savings:,.2f}/mo** savings).")
+    if critical_count:
+        lines.append(f"- [ ] 🔴 **Remediate {critical_count} CRITICAL vulnerabilities**: Fix exposed public databases/buckets and expired certificates.")
+    if stopped_ec2:
+        lines.append(f"- [ ] 🛑 **Clean up {stopped_ec2} stopped EC2 instances**: Terminate abandoned servers or snapshot+delete attached EBS volumes.")
+
+    lines.extend([
+        "\n### 🟠 Phase 2: Sprint Remediation (Next 2 Weeks)",
+    ])
+    if high_count:
+        lines.append(f"- [ ] 🛡️ **Address {high_count} HIGH severity findings**: Setup secret rotations, upgrade deprecated Lambda runtimes.")
+    if waste > 500:
+        lines.append(f"- [ ] 📉 **Right-size oversized services**: Review Airflow MWAA, idle ElastiCache clusters, and NAT Gateways.")
+
+    lines.extend([
+        "\n### 🔵 Phase 3: Architectural Hardening (Quarterly)",
+        "- [ ] ⚙️ **Enable Multi-AZ & Automated Backups**: Eliminate single points of failure for production databases & storage.",
+        "- [ ] 🧹 **Tagging & Lifecycle Policies**: Enforce AWS Config rules and auto-archive S3 / CloudWatch log data.",
+        "",
+    ])
 
     with open(output_path, 'w') as f:
         f.write("\n".join(lines))
 
 
-def audit_single_account(account_id: str, args, severity_order: dict, min_severity: int):
+def audit_single_account(account_id: str, args, severity_order: dict, min_severity: int, quiet=False):
     """Run full audit for a single account directory and save reports."""
     account_dir = OUTPUT_DIR / account_id
     if not account_dir.exists():
@@ -2320,7 +3300,14 @@ def audit_single_account(account_id: str, args, severity_order: dict, min_severi
 
     all_findings = []
     for check_fn in ALL_CHECKS:
-        findings = check_fn(account_dir, args.days)
+        try:
+            findings = check_fn(account_dir, args.days)
+        except Exception as error:
+            print(
+                f"WARNING: {check_fn.__name__} failed for account {account_id}: {error}",
+                file=sys.stderr,
+            )
+            continue
         for f in findings:
             if severity_order.get(f.get("severity", "info"), 4) <= min_severity:
                 if args.category and f.get("category") != args.category:
@@ -2328,6 +3315,23 @@ def audit_single_account(account_id: str, args, severity_order: dict, min_severi
                 all_findings.append(f)
 
     total_est_savings = sum(f.get("est_monthly_waste_usd", 0) for f in all_findings)
+
+    # Service waste breakdown
+    service_waste = {}
+    for f in all_findings:
+        w = f.get("est_monthly_waste_usd", 0)
+        if w > 0:
+            svc = f.get("service", "Other")
+            if svc not in service_waste:
+                service_waste[svc] = {"count": 0, "waste_monthly": 0.0}
+            service_waste[svc]["count"] += 1
+            service_waste[svc]["waste_monthly"] += w
+
+    sorted_svc_waste = sorted(
+        [{"service": k, "count": v["count"], "waste_monthly": round(v["waste_monthly"], 2), "waste_annual": round(v["waste_monthly"] * 12, 2)}
+         for k, v in service_waste.items()],
+        key=lambda x: x["waste_monthly"], reverse=True
+    )
 
     output_data = {
         "generated": datetime.now(timezone.utc).isoformat(),
@@ -2344,24 +3348,51 @@ def audit_single_account(account_id: str, args, severity_order: dict, min_severi
             for c in ["security", "cost", "reliability", "drift"]
             if sum(1 for f in all_findings if f["category"] == c) > 0
         },
+        "service_waste_breakdown": sorted_svc_waste,
+        "quick_wins": sorted(
+            [f for f in all_findings if f.get("est_monthly_waste_usd", 0) > 0 and (f.get("effort") == "low" or "unattached" in f.get("issue", "").lower() or "unassociated" in f.get("issue", "").lower() or "stopped" in f.get("issue", "").lower() or "idle" in f.get("issue", "").lower())],
+            key=lambda x: x["est_monthly_waste_usd"], reverse=True
+        )[:20],
         "top_cost_savings": sorted(
             [f for f in all_findings if f.get("est_monthly_waste_usd", 0) > 0],
             key=lambda x: x["est_monthly_waste_usd"], reverse=True
-        )[:20],
+        )[:25],
         "findings": all_findings,
     }
 
     audit_dir = OUTPUT_DIR / "audit"
     audit_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    audit_json = audit_dir / f"audit-report-{account_id}-{timestamp}.json"
-    with open(audit_json, 'w') as f:
-        json.dump(output_data, f, indent=2, default=str, ensure_ascii=False)
-    print(f"  📄 Saved JSON: {audit_json}")
 
-    audit_md = audit_dir / f"audit-report-{account_id}-{timestamp}.md"
+    # Clean up old timestamped audit files for this account to keep output/audit clean
+    if not getattr(args, 'keep_history', False):
+        for old_file in audit_dir.glob(f"audit-report-{account_id}-*.*"):
+            try:
+                old_file.unlink()
+            except Exception:
+                pass
+
+    if getattr(args, 'keep_history', False):
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        audit_json = audit_dir / f"audit-report-{account_id}-{timestamp}.json"
+        audit_md = audit_dir / f"audit-report-{account_id}-{timestamp}.md"
+        audit_csv = audit_dir / f"audit-report-{account_id}-{timestamp}.csv"
+    else:
+        audit_json = audit_dir / f"audit-report-{account_id}.json"
+        audit_md = audit_dir / f"audit-report-{account_id}.md"
+        audit_csv = audit_dir / f"audit-report-{account_id}.csv"
+
+    with open(audit_json, 'w', encoding='utf-8') as f:
+        json.dump(output_data, f, indent=2, default=str, ensure_ascii=False)
+    if not quiet:
+        print(f"  📄 Saved JSON: {audit_json}")
+
     generate_markdown_report(output_data, audit_md)
-    print(f"  📝 Saved Markdown: {audit_md}")
+    if not quiet:
+        print(f"  📝 Saved Markdown: {audit_md}")
+
+    generate_csv_report(output_data, audit_csv)
+    if not quiet:
+        print(f"  📊 Saved CSV: {audit_csv}")
 
     return output_data
 
@@ -2378,6 +3409,10 @@ def main():
                         help='Output as JSON (for presentations/reports)')
     parser.add_argument('--markdown', '-m', action='store_true',
                         help='Print Markdown report to stdout')
+    parser.add_argument('--csv', action='store_true',
+                        help='Print CSV report to stdout')
+    parser.add_argument('--keep-history', action='store_true',
+                        help='Keep timestamped historical report files instead of overwriting')
     parser.add_argument('--severity', '-s', default=None,
                         choices=['critical', 'high', 'medium', 'low', 'info'],
                         help='Minimum severity to show (this level and everything more severe)')
@@ -2389,6 +3424,7 @@ def main():
     parser.add_argument('--profile', '-p', default=None,
                         help='AWS profile for --live-pricing or account resolution (Pricing API is free/read-only)')
     args = parser.parse_args()
+    structured_output = args.json or args.markdown or args.csv
 
     # Optional: live pricing via AWS Pricing API
     if args.live_pricing:
@@ -2401,7 +3437,7 @@ def main():
         if _SESSION is None:
             print(f"ERROR: could not create session for profile {args.profile}")
             sys.exit(1)
-        print(f"  💲 Live pricing enabled via profile {args.profile}")
+        print(f"  💲 Live pricing enabled via profile {args.profile}", file=sys.stderr)
 
     if not OUTPUT_DIR.exists():
         print(f"ERROR: {OUTPUT_DIR} does not exist. Run inventory scripts first.")
@@ -2414,7 +3450,7 @@ def main():
     accounts_to_audit = []
     if args.all:
         accounts_to_audit = sorted([d.name for d in OUTPUT_DIR.iterdir()
-                                    if d.is_dir() and re.match(r'^\d{12}$', d.name)])
+                                     if d.is_dir() and re.match(r'^\d{12}$', d.name)])
         if not accounts_to_audit:
             print("ERROR: No valid account directories found under output/")
             sys.exit(1)
@@ -2424,8 +3460,11 @@ def main():
 
     multi_reports = []
     for acct_id in accounts_to_audit:
-        print(f"\n🔍 Auditing Account: {acct_id}")
-        output_data = audit_single_account(acct_id, args, severity_order, min_severity)
+        if not structured_output:
+            print(f"\n🔍 Auditing Account: {acct_id}")
+        output_data = audit_single_account(
+            acct_id, args, severity_order, min_severity, quiet=structured_output
+        )
         if output_data:
             multi_reports.append(output_data)
 
@@ -2437,8 +3476,17 @@ def main():
                     print(json.dumps(output_data, indent=2, default=str))
                 elif args.markdown:
                     audit_dir = OUTPUT_DIR / "audit"
-                    latest_md = sorted(glob.glob(str(audit_dir / f"audit-report-{acct_id}-*.md")), reverse=True)[0]
-                    with open(latest_md) as f:
+                    md_path = audit_dir / f"audit-report-{acct_id}.md"
+                    if not md_path.exists():
+                        md_path = sorted(glob.glob(str(audit_dir / f"audit-report-{acct_id}*.md")), reverse=True)[0]
+                    with open(md_path) as f:
+                        print(f.read())
+                elif args.csv:
+                    audit_dir = OUTPUT_DIR / "audit"
+                    csv_path = audit_dir / f"audit-report-{acct_id}.csv"
+                    if not csv_path.exists():
+                        csv_path = sorted(glob.glob(str(audit_dir / f"audit-report-{acct_id}*.csv")), reverse=True)[0]
+                    with open(csv_path) as f:
                         print(f.read())
                 else:
                     # Console report
@@ -2451,7 +3499,7 @@ def main():
                     print(f"  Staleness threshold:   {args.days} days")
                     print(f"  Total findings:        {len(all_findings)}")
                     if total_est_savings > 0:
-                        print(f"  💰 Est. monthly waste: ${total_est_savings:,.0f}/mo")
+                        print(f"  💰 Est. monthly waste: ${total_est_savings:,.2f}/mo (${total_est_savings * 12:,.2f}/yr)")
                     print()
 
                     category_icons = {"security": "🔒", "cost": "💰", "reliability": "⚙️", "drift": "🧹"}
@@ -2471,6 +3519,17 @@ def main():
                             print(f"    {severity_icons[sev]} {sev.upper():<10} {count:>5}")
                     print()
 
+                    # Quick wins
+                    top_costs = output_data.get("top_cost_savings", [])
+                    quick_wins = [f for f in top_costs if f.get("effort") == "low" or "unattached" in f.get("issue", "").lower() or "stopped" in f.get("issue", "").lower() or "idle" in f.get("issue", "").lower()][:5]
+                    if quick_wins:
+                        qw_total = sum(f.get("est_monthly_waste_usd", 0) for f in quick_wins)
+                        print(f"  🚀 INSTANT QUICK WINS (Save ${qw_total:,.2f}/mo today — Low Risk):")
+                        print(f"  {'─' * 86}")
+                        for f in quick_wins:
+                            print(f"    ${f['est_monthly_waste_usd']:>8,.0f}/mo  {f['service']:<16} {f['resource'][:35]:<35} -> {f.get('action')[:45]}")
+                        print()
+
                     cost_findings = sorted(
                         [f for f in all_findings if f.get("est_monthly_waste_usd", 0) > 0],
                         key=lambda x: x["est_monthly_waste_usd"], reverse=True
@@ -2480,6 +3539,15 @@ def main():
                         print(f"  {'─' * 86}")
                         for f in cost_findings:
                             print(f"    ${f['est_monthly_waste_usd']:>8,.0f}/mo  {f['service']:<18} {f['resource'][:40]:<40} {f['issue'][:40]}")
+                        print()
+
+                    svc_waste = output_data.get("service_waste_breakdown", [])
+                    if svc_waste:
+                        print("  📈 SERVICE WASTE BREAKDOWN (TOP 5):")
+                        print(f"  {'─' * 86}")
+                        for sw in svc_waste[:5]:
+                            share = (sw['waste_monthly'] / total_est_savings * 100) if total_est_savings > 0 else 0
+                            print(f"    ${sw['waste_monthly']:>8,.2f}/mo  {sw['service']:<18} ({sw['count']:>3} findings, {share:>5.1f}% of total waste)")
                         print()
 
                     for cat in ["security", "cost", "reliability", "drift"]:
@@ -2506,27 +3574,59 @@ def main():
                         print()
 
                     print("  " + "=" * 86)
-                    print("  📋 RECOMMENDED ACTIONS:")
+                    print("  📋 3-PHASE ACTION PLAYBOOK:")
                     print("  " + "=" * 86)
 
                     critical_count = sum(1 for f in all_findings if f["severity"] == "critical")
                     high_count = sum(1 for f in all_findings if f["severity"] == "high")
 
+                    print("  🟢 Phase 1: Immediate Actions (Today)")
+                    if quick_wins:
+                        print(f"     1. 💰 Execute Quick Wins — Save ${sum(f.get('est_monthly_waste_usd', 0) for f in quick_wins):,.0f}/mo with zero downtime")
                     if critical_count:
-                        print(f"  1. 🔴 Fix {critical_count} CRITICAL issues immediately (security exposure, expired certs)")
-                    if high_count:
-                        print(f"  2. 🟠 Address {high_count} HIGH issues this sprint (no HA, stale credentials, deprecated runtimes)")
-                    if total_est_savings > 100:
-                        print(f"  3. 💰 Review cost waste — est. ${total_est_savings:,.0f}/mo savings possible")
-
+                        print(f"     2. 🔴 Fix {critical_count} CRITICAL vulnerabilities immediately (exposed DBs, expired certs)")
                     stopped_ec2 = sum(1 for f in all_findings if f["service"] == "EC2" and "Stopped" in f["issue"])
                     if stopped_ec2:
-                        print(f"  4. 🛑 {stopped_ec2} stopped EC2 instances — terminate or snapshot+delete EBS")
+                        print(f"     3. 🛑 Clean up {stopped_ec2} stopped EC2 instances — terminate or snapshot+delete EBS")
 
+                    print("\n  🟠 Phase 2: Sprint Remediation (Next 2 Weeks)")
+                    if high_count:
+                        print(f"     4. 🛡️ Address {high_count} HIGH issues (stale credentials, unencrypted SSM, deprecated runtimes)")
+                    if total_est_savings > 500:
+                        print(f"     5. 📉 Review top waste services — ${total_est_savings:,.0f}/mo total savings potential")
+
+                    print("\n  🔵 Phase 3: Architectural Hardening (Quarterly)")
+                    print("     6. ⚙️ Eliminate Single Points of Failure (enable Multi-AZ for RDS/OpenSearch/FSx)")
+                    print("     7. 🧹 Enforce AWS Config recording & automated S3/CloudWatch lifecycle rules")
                     print()
 
+    if structured_output and len(multi_reports) > 1:
+        if args.json:
+            print(json.dumps({"accounts": multi_reports}, indent=2, default=str))
+        elif args.csv:
+            fieldnames = [
+                "account_id", "severity", "category", "service", "region",
+                "resource", "issue", "est_monthly_waste_usd", "action", "effort",
+            ]
+            writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
+            writer.writeheader()
+            for report in multi_reports:
+                for item in report.get("findings", []):
+                    writer.writerow({
+                        "account_id": report.get("account_id"),
+                        **{field: item.get(field, "") for field in fieldnames if field != "account_id"},
+                    })
+        else:
+            audit_dir = OUTPUT_DIR / "audit"
+            for report in multi_reports:
+                acct_id = report["account_id"]
+                paths = sorted(glob.glob(str(audit_dir / f"audit-report-{acct_id}*.md")))
+                if paths:
+                    with open(paths[-1]) as f:
+                        print(f.read())
+
     # Multi-account consolidated summary table
-    if len(multi_reports) > 1:
+    if not structured_output and len(multi_reports) > 1:
         print("\n" + "=" * 90)
         print("  🌐 MULTI-ACCOUNT AUDIT SUMMARY")
         print("=" * 90)

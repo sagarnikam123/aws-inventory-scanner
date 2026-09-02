@@ -85,9 +85,10 @@ output/
 │   ├── rds/
 │   │   └── rds-inventory-<account_id>-<timestamp>.json
 │   └── ...
-└── combined/
-    └── cost/
-        └── cost-inventory-all-accounts-<timestamp>.json
+└── audit/
+    ├── audit-report-<account_id>.json
+    ├── audit-report-<account_id>.md
+    └── audit-report-<account_id>.csv
 ```
 
 Data is flushed incrementally — if the script crashes mid-run, all previously fetched regions are already on disk.

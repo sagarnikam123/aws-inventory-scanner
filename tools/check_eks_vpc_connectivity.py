@@ -9,27 +9,42 @@ Reads the latest EKS and VPC inventory JSONs and produces:
      - VPC Peering
      - Transit Gateway (shared TGW attachment)
 
+By default it aggregates the latest EKS and VPC inventory from every account
+directory under output/, so cross-account peering/TGW paths are analyzed. Pass
+--eks-file / --vpc-file to restrict the analysis to a single inventory file.
+
 Usage:
-    python analysis/eks_vpc_connectivity.py
-    python analysis/eks_vpc_connectivity.py --eks-file output/combined/eks/eks-cluster-inventory-*.json
-    python analysis/eks_vpc_connectivity.py --json   # Output as JSON instead of table
+    python tools/check_eks_vpc_connectivity.py
+    python tools/check_eks_vpc_connectivity.py --eks-file output/123456789012/eks/eks-inventory-123456789012-20260101-000000.json
+    python tools/check_eks_vpc_connectivity.py --json   # Output as JSON instead of table
 """
 
 import sys
 import json
-import glob
 import argparse
 from pathlib import Path
 from collections import defaultdict
 
 TOOLS_DIR = Path(__file__).parent.parent
-OUTPUT_DIR = TOOLS_DIR / "output" / "combined"
+OUTPUT_DIR = TOOLS_DIR / "output"
 
 
-def find_latest(directory, pattern):
-    """Find the most recently modified file matching a glob pattern."""
-    files = sorted(glob.glob(str(directory / pattern)), key=lambda f: Path(f).stat().st_mtime, reverse=True)
-    return files[0] if files else None
+def latest_per_account(pattern, account_filter=None):
+    """Return the newest inventory file per account directory under output/.
+
+    output/<account_id>/<service>/<service>-inventory-<acct>-<ts>.json — pick the
+    most recent file within each account dir so every account is represented
+    (a single global 'newest' would silently drop all other accounts).
+    """
+    by_account = {}
+    for match in OUTPUT_DIR.glob(pattern):
+        account_dir = match.parent.parent.name
+        if account_filter and account_filter != account_dir:
+            continue
+        current = by_account.get(account_dir)
+        if current is None or match.stat().st_mtime > current.stat().st_mtime:
+            by_account[account_dir] = match
+    return [str(p) for p in by_account.values()]
 
 
 def load_eks_inventory(path):
@@ -256,22 +271,25 @@ def print_isolated_clusters(clusters, edges):
 
 def main():
     parser = argparse.ArgumentParser(description='EKS ↔ VPC Connectivity Analyzer')
-    parser.add_argument('--eks-file', default=None, help='Path to EKS inventory JSON (default: latest in output/combined/eks/)')
-    parser.add_argument('--vpc-file', default=None, help='Path to VPC inventory JSON (default: latest in output/combined/vpc/)')
+    parser.add_argument('--account', '-a', default=None, help='Filter by AWS account ID (default: all accounts)')
+    parser.add_argument('--eks-file', default=None, help='Path to EKS inventory JSON (default: latest in output/<account>/eks/)')
+    parser.add_argument('--vpc-file', default=None, help='Path to VPC inventory JSON (default: latest in output/<account>/vpc/)')
     parser.add_argument('--json', action='store_true', help='Output as JSON instead of table')
     args = parser.parse_args()
 
-    # Find inventory files
-    eks_file = args.eks_file or find_latest(OUTPUT_DIR / "eks", "eks-cluster-inventory-*.json")
-    vpc_file = args.vpc_file or find_latest(OUTPUT_DIR / "vpc", "vpc-inventory-*.json")
+    # Find inventory files: a single file if overridden, else the latest per account.
+    eks_inventory_files = [args.eks_file] if args.eks_file else latest_per_account("*/eks/eks-*.json", account_filter=args.account)
+    vpc_inventory_files = [args.vpc_file] if args.vpc_file else latest_per_account("*/vpc/vpc-*.json", account_filter=args.account)
 
-    if not eks_file:
+    if not eks_inventory_files:
         print("ERROR: No EKS inventory found. Run: python inventory/get_eks_inventory.py")
         sys.exit(1)
 
-    print(f"EKS inventory: {eks_file}")
-    clusters = load_eks_inventory(eks_file)
-    print(f"  Found {len(clusters)} EKS clusters")
+    clusters = []
+    for eks_file in eks_inventory_files:
+        print(f"EKS inventory: {eks_file}")
+        clusters.extend(load_eks_inventory(eks_file))
+    print(f"  Found {len(clusters)} EKS clusters across {len(eks_inventory_files)} account file(s)")
 
     # Check if any clusters lack vpc_id
     missing_vpc = [c for c in clusters if not c["vpc_id"]]
@@ -279,9 +297,14 @@ def main():
         print(f"  ⚠️  {len(missing_vpc)} clusters missing vpc_id — re-run: python inventory/get_eks_inventory.py")
 
     peerings, tgw_vpc_map = [], {}
-    if vpc_file:
-        print(f"VPC inventory: {vpc_file}")
-        peerings, tgw_vpc_map = load_vpc_inventory(vpc_file)
+    if vpc_inventory_files:
+        for vpc_file in vpc_inventory_files:
+            print(f"VPC inventory: {vpc_file}")
+            file_peerings, file_tgw_map = load_vpc_inventory(vpc_file)
+            peerings.extend(file_peerings)
+            # Merge TGW→VPC sets across accounts so a shared TGW links all of them.
+            for tgw_id, vpc_ids in file_tgw_map.items():
+                tgw_vpc_map.setdefault(tgw_id, set()).update(vpc_ids)
         print(f"  Found {len(peerings)} peering connections, {len(tgw_vpc_map)} transit gateways with VPC attachments")
     else:
         print("VPC inventory: NOT FOUND — run: python inventory/get_vpc_inventory.py")
